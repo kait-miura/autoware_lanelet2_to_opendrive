@@ -2917,6 +2917,9 @@ def preprocess_and_convert_with_hydra(
         local_geo_reference=(
             vissim_dict.get("local_geo_reference", True) if vissim_dict else True
         ),
+        constant_lane_widths=(
+            vissim_dict.get("constant_lane_widths", True) if vissim_dict else True
+        ),
     )
     if vissim_config.enabled and vissim_config.local_geo_reference:
         # The local-frame PROJ string needs the resolved MGRS grid and the

@@ -68,7 +68,7 @@ Legend: ✅ satisfied ｜ ⚠ partial / needs verification ｜ ❌ not satisfied
 | Positive/negative lane index semantics | ⚠ | all driving lanes are positive (left side) with `rule="LHT"`; Vissim builds positive-index lanes as opposite-direction links | verify with LHT import setting |
 | Connectors from `link::predecessor/successor` | ✅ | connecting roads always carry explicit road→road links with `contactPoint`; incoming/outgoing roads reference the junction | none |
 | `junction` / `connection` / `laneLink` well-formed | ✅ | 388 connections, 0 missing `laneLink`, 0 dangling road refs, `connectingRoad@junction` consistent | none |
-| Width as constant (Vissim converts) | ⚠ | 98 % of `<width>` records are polynomial; Vissim will constant-ize. 38–40 % of lanes swing ≥ 0.25 m → Vissim inserts connector + 2 × 1.1 m links there (allowed, but expect many synthetic links). 1–4 lanes per map dip below 1.0 m → clamped to 1 m | none (behavioral note) |
+| Width as constant (Vissim converts) | ❌→✅ | 98 % of `<width>` records were polynomial (mean 40, max 146 records per lane). Vissim inserts a connector + 2 × 1.1 m links at every ≥ 0.25 m variation, shattering each road into dozens of fragments — confirmed on a real import as tangled connector webs and a "Nodes … overlap on link 'Road_9-0-Left **Start**' / link segments invalid" error (the *Start* link is Vissim's inserted 1.1 m fragment). The profile now collapses each lane to a single constant width (arc-length-weighted mean) | `vissim.constant_lane_widths` (default on) |
 | Spline points ≥ 0.5 m apart | ⚠ | 53–309 geometry segments < 0.5 m; roads as short as 0.01 m | profile warns; stub consolidation is future work |
 | `geoReference` proj-string placement | ❌→✅ | see risk 2 | profile emits local-frame tmerc |
 | No reliance on signals / markings / speed limits / lane closure | ✅ | signals, road marks, speeds are informational in the output; conversion topology never depends on them | none |
@@ -108,11 +108,17 @@ Legend: ✅ satisfied ｜ ⚠ partial / needs verification ｜ ❌ not satisfied
   profile with road IDs. Divergence stubs are required by the CARLA
   loader fix (#291 series), so they are kept; a Vissim-specific stub
   consolidation pass is future work.
-- **Width variation ≥ 0.25 m on 38–40 % of lanes**: Vissim inserts
-  connectors and 1.1 m links at each such transition. Not an error, but
-  the imported network will contain many short synthetic links. If this
-  is undesirable, lower `width_estimation` sampling density or pre-smooth
-  widths for Vissim.
+- **Polynomial width records** (confirmed on a real Vissim import):
+  with dense polynomial `<width>` chains, Vissim's width-change
+  machinery (connector + 2 × 1.1 m links per ≥ 0.25 m variation)
+  fragmented every road, produced tangled webs of generated connectors
+  ("Road_44-0-Left Connector - 1", …) and node-overlap errors on the
+  inserted "… Start" fragments where two junctions sit close together.
+  Fixed by `vissim.constant_lane_widths` (default on): each lane's chain
+  is collapsed to its arc-length-weighted mean width. Note that after
+  this change width steps between *consecutive roads* can still exceed
+  0.25 m at a genuine widening/narrowing — Vissim then inserts one
+  connector there, which is the intended behavior.
 
 ### Minor / informational
 
@@ -143,6 +149,7 @@ is untouched. Settings (see `conf/target/vissim.yaml`):
 | `vissim.strip_nonstandard_attributes` | `true` | remove `road@rule`, `lane@rule`, `access@rule` |
 | `vissim.param_poly3_p_range` | `normalized` | `normalized`: exact re-parameterization to `p ∈ [0,1]`, `pRange` attribute removed (schema-clean). `arcLength`: keep coefficients and attribute |
 | `vissim.local_geo_reference` | `true` | replace the header proj-string with the exact local-frame tmerc string |
+| `vissim.constant_lane_widths` | `true` | collapse each lane's `<width>` chain to a single constant record (arc-length-weighted mean) — prevents Vissim's per-variation connector/1.1 m-link insertion from fragmenting the network |
 
 The pass logs a **Vissim import report**: counts of roads shorter than
 1.1 m / 0.5 m, lanes whose width falls below 1.0 m, and lanes whose
@@ -161,17 +168,25 @@ width swing exceeds 0.25 m.
 
 ## Open items / verification checklist
 
-1. Import a small converted map into an empty `.inpx` with
-   `param_poly3_p_range: normalized`, then with `arcLength`; keep the
-   setting whose curves are correct.
+First-import findings (Odaiba clip, 2026-07-31): the network landed on the
+background map at the correct position and curves rendered with plausible
+shapes — the normalized `paramPoly3` interpretation (item 1), parametric
+cubic support (item 3), and the local-frame geoReference (item 4) all look
+correct. The polynomial-width fragmentation this import exposed is fixed by
+`constant_lane_widths` (see above).
+
+1. ~~normalized vs arcLength import test~~ — normalized appears correct;
+   re-confirm after the constant-width re-export.
 2. Confirm Vissim's left-side-traffic import option yields links in the
    travel direction for positive-index lanes (LHT Japanese maps).
-3. Confirm whether Vissim's "cubic polynomial" geometry support includes
-   `paramPoly3` (parametric) or only `poly3`. If only `poly3`, curved
-   geometry needs a dedicated emission mode (not yet implemented).
-4. Check the imported network position against the Vissim background map
-   (validates the local-frame proj-string end to end).
-5. Review roads listed in the import report (< 0.5 m) inside Vissim; if
+3. ~~paramPoly3 support~~ — appears supported (curved links imported).
+4. ~~Background-map placement~~ — appears correct; re-confirm visually.
+5. Re-import after the constant-width fix and check that the
+   "Nodes … overlap on link …" error and the dense generated-connector
+   webs are gone. If node overlaps persist around the small twin
+   junctions (1001/1002-style, ~1.8 m connecting roads), plan the
+   junction/stub consolidation pass.
+6. Review roads listed in the import report (< 0.5 m) inside Vissim; if
    they degenerate, plan the stub-consolidation pass.
 
 ---

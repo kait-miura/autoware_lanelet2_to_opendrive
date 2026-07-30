@@ -211,9 +211,80 @@ def test_report_flags_short_roads_and_width_indicators():
     # Vissim and therefore not counted). Road 2's lane starts at 0.5 m.
     assert report.checked_lanes == 2
     assert report.lanes_below_min_width == 1
-    # Width swings: road 1 lane is constant; road 2 swings only
-    # 0.3 * 0.01 = 0.003 m over its length.
+    # After constantization no lane can swing at all.
     assert report.lanes_above_width_swing_threshold == 0
+    # Only road 2's lane had a non-constant width chain.
+    assert report.lanes_width_constantized == 1
+
+
+# ---------------------------------------------------------------------------
+# constant lane widths
+# ---------------------------------------------------------------------------
+
+
+def _lane_with_widths(records: str, length: float) -> ET._Element:
+    xml = f"""
+    <OpenDRIVE>
+      <header revMajor="1" revMinor="4"/>
+      <road id="1" length="{length}" junction="-1">
+        <planView>
+          <geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="{length}"><line/></geometry>
+        </planView>
+        <lanes>
+          <laneSection s="0.0">
+            <left>
+              <lane id="1" type="driving" level="false">
+                {records}
+              </lane>
+            </left>
+            <center><lane id="0" type="none" level="false"/></center>
+          </laneSection>
+        </lanes>
+      </road>
+    </OpenDRIVE>
+    """
+    return ET.fromstring(xml.encode())
+
+
+def test_constant_lane_widths_arc_length_weighted_mean():
+    # Two records over a 10 m road: 4 m of linear ramp 2→3 m
+    # (a=2, b=0.25), then 6 m constant 3 m.
+    # Exact mean = (∫₀⁴(2+0.25s)ds + 3·6) / 10 = (10 + 18) / 10 = 2.8.
+    root = _lane_with_widths(
+        '<width sOffset="0.0" a="2.0" b="0.25" c="0.0" d="0.0"/>'
+        '<width sOffset="4.0" a="3.0" b="0.0" c="0.0" d="0.0"/>',
+        length=10.0,
+    )
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+    assert report.lanes_width_constantized == 1
+
+    widths = root.findall(".//lane[@id='1']/width")
+    assert len(widths) == 1
+    assert float(widths[0].get("sOffset")) == 0.0
+    assert float(widths[0].get("a")) == pytest.approx(2.8, abs=1e-12)
+    assert all(float(widths[0].get(k)) == 0.0 for k in "bcd")
+
+
+def test_constant_lane_widths_keeps_already_constant_record():
+    root = _lane_with_widths(
+        '<width sOffset="0.0" a="3.5" b="0.0" c="0.0" d="0.0"/>', length=10.0
+    )
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+    assert report.lanes_width_constantized == 0
+    assert float(root.find(".//lane[@id='1']/width").get("a")) == 3.5
+
+
+def test_constant_lane_widths_can_be_disabled():
+    root = _lane_with_widths(
+        '<width sOffset="0.0" a="2.0" b="0.25" c="0.0" d="0.0"/>'
+        '<width sOffset="4.0" a="3.0" b="0.0" c="0.0" d="0.0"/>',
+        length=10.0,
+    )
+    report = apply_vissim_profile(
+        root, VissimConfig(enabled=True, constant_lane_widths=False)
+    )
+    assert report.lanes_width_constantized == 0
+    assert len(root.findall(".//lane[@id='1']/width")) == 2
 
 
 # ---------------------------------------------------------------------------

@@ -55,3 +55,11 @@ vissim:
   # exported local frame so Vissim places the network correctly on its
   # background map (issue #550).
   local_geo_reference: true
+
+  # Collapse each lane's polynomial <width> records to a single constant
+  # (arc-length-weighted mean). Vissim only supports constant lane widths;
+  # polynomial records trigger its width-change machinery (a connector plus
+  # two 1.1 m links per >= 0.25 m variation), which fragments every road
+  # into dozens of links and causes "node overlap on link ... Start"
+  # import errors.
+  constant_lane_widths: true

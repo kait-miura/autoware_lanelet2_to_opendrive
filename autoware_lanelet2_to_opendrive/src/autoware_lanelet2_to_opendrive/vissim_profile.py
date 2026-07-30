@@ -16,6 +16,13 @@ tree — without touching the conversion pipeline — so that other targets
   the *exported local frame* (issue #550: the default string describes
   absolute UTM while the coordinates are local offsets, which misplaces
   the network on Vissim's background map),
+* collapses each lane's polynomial ``<width>`` chain to a single constant
+  record (arc-length-weighted mean). Vissim only supports constant lane
+  widths: every width variation ≥ 0.25 m makes its importer insert a
+  connector plus two 1.1 m links, so dense polynomial width records
+  shatter each road into dozens of fragments — observed as tangled
+  connector webs and "node overlap on link …-Left Start" errors on
+  import,
 * reports constructs Vissim is known to degrade on (roads shorter than
   its 0.5 m spline spacing / 1.1 m inserted-link length, lane widths
   below the 1 m clamp, width swings beyond the 0.25 m connector
@@ -78,6 +85,12 @@ class VissimConfig:
         local_geo_reference_proj: The precomputed local-frame PROJ string.
             Computed by the caller (it needs the resolved projection origin
             and offsets) via :func:`local_frame_proj_string`.
+        constant_lane_widths: Collapse each lane's ``<width>`` records to a
+            single constant (arc-length-weighted mean over the lane
+            section). Vissim treats widths as constants anyway; leaving the
+            polynomial records makes its importer insert a connector and
+            two 1.1 m links at every ≥ 0.25 m variation, fragmenting the
+            network and causing node-overlap errors.
     """
 
     enabled: bool = False
@@ -85,6 +98,7 @@ class VissimConfig:
     param_poly3_p_range: str = "normalized"
     local_geo_reference: bool = True
     local_geo_reference_proj: Optional[str] = None
+    constant_lane_widths: bool = True
 
     def __post_init__(self) -> None:
         if self.param_poly3_p_range not in _P_RANGE_MODES:
@@ -101,6 +115,7 @@ class VissimProfileReport:
     rule_attributes_stripped: int = 0
     param_poly3_reparameterized: int = 0
     geo_reference_replaced: bool = False
+    lanes_width_constantized: int = 0
     roads_below_spline_spacing: List[str] = field(default_factory=list)
     roads_below_inserted_link_length: List[str] = field(default_factory=list)
     lanes_below_min_width: int = 0
@@ -111,10 +126,12 @@ class VissimProfileReport:
         """Emit the report at INFO level (WARNING for degenerate roads)."""
         log.info(
             "Vissim profile: stripped %d rule attributes, "
-            "re-parameterized %d paramPoly3 segments, geoReference %s",
+            "re-parameterized %d paramPoly3 segments, geoReference %s, "
+            "constantized widths on %d lanes",
             self.rule_attributes_stripped,
             self.param_poly3_reparameterized,
             "replaced" if self.geo_reference_replaced else "kept",
+            self.lanes_width_constantized,
         )
         if self.roads_below_spline_spacing:
             log.warning(
@@ -266,6 +283,84 @@ def _replace_geo_reference(root: ET._Element, proj: str) -> bool:
     return True
 
 
+def _mean_lane_width(width_elems: List[ET._Element], section_length: float) -> float:
+    """Arc-length-weighted mean of a lane's piecewise-cubic width profile.
+
+    Each ``<width>`` record covers ``[sOffset_i, sOffset_{i+1})`` (the last
+    one runs to the end of the lane section) with
+    ``w(ds) = a + b·ds + c·ds² + d·ds³``. The exact integral over a span
+    ``h`` is ``a·h + b·h²/2 + c·h³/3 + d·h⁴/4``.
+    """
+    total_area = 0.0
+    total_span = 0.0
+    for i, width in enumerate(width_elems):
+        s_start = float(width.get("sOffset", "0"))
+        s_end = (
+            float(width_elems[i + 1].get("sOffset", "0"))
+            if i + 1 < len(width_elems)
+            else section_length
+        )
+        h = max(s_end - s_start, 0.0)
+        if h == 0.0:
+            continue
+        a = float(width.get("a", "0"))
+        b = float(width.get("b", "0"))
+        c = float(width.get("c", "0"))
+        d = float(width.get("d", "0"))
+        total_area += a * h + b * h * h / 2.0 + c * h**3 / 3.0 + d * h**4 / 4.0
+        total_span += h
+    if total_span == 0.0:
+        # Zero-length section (degenerate stub): fall back to the first
+        # record's constant term.
+        return float(width_elems[0].get("a", "0"))
+    return total_area / total_span
+
+
+def _constantize_lane_widths(root: ET._Element) -> int:
+    """Replace each lane's ``<width>`` chain with one constant record.
+
+    Vissim defines lane width as a constant; polynomial records only feed
+    its ≥ 0.25 m width-change machinery, which inserts a connector and two
+    1.1 m links per variation and fragments the network. Returns the number
+    of lanes whose records were collapsed.
+    """
+    constantized = 0
+    for road in root.iter("road"):
+        road_length = float(road.get("length", "0"))
+        lanes_elem = road.find("lanes")
+        if lanes_elem is None:
+            continue
+        sections = lanes_elem.findall("laneSection")
+        for index, section in enumerate(sections):
+            s_section = float(section.get("s", "0"))
+            s_next = (
+                float(sections[index + 1].get("s", "0"))
+                if index + 1 < len(sections)
+                else road_length
+            )
+            section_length = max(s_next - s_section, 0.0)
+            for lane in section.iter("lane"):
+                widths = lane.findall("width")
+                if not widths:
+                    continue
+                already_constant = len(widths) == 1 and all(
+                    abs(float(widths[0].get(k, "0"))) < 1e-12 for k in "bcd"
+                )
+                if already_constant:
+                    continue
+                mean = _mean_lane_width(widths, section_length)
+                first = widths[0]
+                first.set("sOffset", "0.0")
+                first.set("a", str(mean))
+                first.set("b", "0.0")
+                first.set("c", "0.0")
+                first.set("d", "0.0")
+                for extra in widths[1:]:
+                    lane.remove(extra)
+                constantized += 1
+    return constantized
+
+
 def _width_samples(width_elems: List[ET._Element], road_length: float) -> List[float]:
     """Sample each width polynomial at the start/middle/end of its domain."""
     samples: List[float] = []
@@ -346,6 +441,11 @@ def apply_vissim_profile(
             root, config.local_geo_reference_proj
         )
 
+    if config.constant_lane_widths:
+        report.lanes_width_constantized = _constantize_lane_widths(root)
+
+    # Indicators are collected after all edits so they describe the file
+    # Vissim will actually see.
     _collect_import_indicators(root, report)
     return report
 
