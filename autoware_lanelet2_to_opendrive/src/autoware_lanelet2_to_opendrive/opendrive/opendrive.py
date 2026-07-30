@@ -4,7 +4,7 @@ import importlib.metadata
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 import lxml.etree as ET
 
@@ -119,17 +119,26 @@ def get_version_string() -> str:
         return "unknown"
 
 
-def export_to_xml(opendrive: OpenDRIVE) -> str:
+def export_to_xml(
+    opendrive: OpenDRIVE,
+    postprocess: Optional[Callable[[ET._Element], None]] = None,
+) -> str:
     """
     Export OpenDRIVE object to XML string with version comment.
 
     Args:
         opendrive: OpenDRIVE object to export
+        postprocess: Optional hook applied to the serialized ``<OpenDRIVE>``
+            element before rendering (e.g. a consumer-specific export
+            profile). It mutates the tree in place.
 
     Returns:
         XML string representation with version comment
     """
     xml_element = opendrive.to_xml()
+
+    if postprocess is not None:
+        postprocess(xml_element)
 
     # Get version string (from git or package metadata)
     version = get_version_string()
@@ -152,14 +161,20 @@ def export_to_xml(opendrive: OpenDRIVE) -> str:
     return xml_str
 
 
-def save_opendrive_to_file(opendrive: OpenDRIVE, filepath: Union[str, Path]) -> None:
+def save_opendrive_to_file(
+    opendrive: OpenDRIVE,
+    filepath: Union[str, Path],
+    postprocess: Optional[Callable[[ET._Element], None]] = None,
+) -> None:
     """
     Save OpenDRIVE object to XML file.
 
     Args:
         opendrive: OpenDRIVE object to save
         filepath: Path to save the XML file
+        postprocess: Optional hook applied to the serialized tree before
+            writing (see :func:`export_to_xml`).
     """
-    xml_str = export_to_xml(opendrive)
+    xml_str = export_to_xml(opendrive, postprocess=postprocess)
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(xml_str)

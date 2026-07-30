@@ -380,6 +380,10 @@ def _evaluate_geometry_world(geom: GeometryBase, p: float) -> tuple[float, float
             geom.cV,
             geom.dV,
         )
+        # Normalized paramPoly3 (Vissim export profile output) is defined
+        # over p̂ ∈ [0, 1]; rescale the arc-length parameter accordingly.
+        if geom.pRange == "normalized" and geom.length > 0.0:
+            p = p / geom.length
         return evaluate_plan_view_world(
             geom.x, geom.y, geom.hdg, p, param_poly3_coeffs=coeffs
         )
@@ -553,7 +557,12 @@ def parse_roads_from_xodr(
                             bV=float(pp3_elem.get("bV", "0")),
                             cV=float(pp3_elem.get("cV", "0")),
                             dV=float(pp3_elem.get("dV", "0")),
-                            pRange=pp3_elem.get("pRange", "arcLength"),
+                            # Files from this converter always carry an
+                            # explicit pRange except under the Vissim export
+                            # profile, which re-parameterizes to the
+                            # normalized convention and drops the non-1.4
+                            # attribute (matching the ASAM default).
+                            pRange=pp3_elem.get("pRange", "normalized"),
                         )
                     )
                 elif arc_elem is not None:

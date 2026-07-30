@@ -188,6 +188,16 @@ def _eval_geometry_world(
             float(param_poly3.get("cV", "0.0")),
             float(param_poly3.get("dV", "0.0")),
         )
+        # A missing pRange means the normalized convention (ASAM default;
+        # the Vissim export profile drops the non-1.4 attribute after
+        # re-parameterizing). Rescale the arc-length parameter to p̂ ∈ [0, 1].
+        if param_poly3.get("pRange", "normalized") == "normalized":
+            try:
+                length = float(geom_elem.get("length"))
+            except (TypeError, ValueError):
+                length = 0.0
+            if length > 0.0:
+                p = p / length
 
     return evaluate_plan_view_world(x, y, hdg, p, coeffs, arc_curvature)
 

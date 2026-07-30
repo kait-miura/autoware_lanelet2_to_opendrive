@@ -1,0 +1,57 @@
+# PTV Vissim target configuration
+# Produces OpenDRIVE 1.4 output adapted to the Vissim openDRIVE importer.
+# See docs/vissim-compatibility.md for the full compatibility review.
+
+# Vissim ignores signals entirely, so no junction-based filtering is needed.
+exclude_non_junction_signals: false
+
+# Traffic rule defaults to RHT (Japanese maps override with LHT in map config)
+# traffic_rule: "RHT"
+
+# OpenDRIVE signal configuration (signals are retained but ignored by Vissim)
+signal:
+  country: "DE"
+
+# ParamPoly3 segment generation configuration
+# Vissim sets spline points at a minimum spacing of 0.5 m, so segments
+# shorter than that are avoided (same floor as the CARLA target).
+parampoly3:
+  enabled: true
+  min_segment_length: 0.5  # meters (Vissim minimum spline point spacing)
+  default_segment_length: 1.0  # meters
+  max_segments: 100
+  min_segments: 1
+  coefficient_epsilon: 1.0e-8
+
+# Stop line object configuration (objects are ignored by Vissim)
+stopline:
+  width: 0.1
+
+# Width spline sampling configuration
+width_estimation:
+  adaptive_sampling: true
+  min_samples: 5
+  max_samples: 50
+  default_sample_interval: 5.0
+
+# Vissim export profile (write-time post-processing; see vissim_profile.py)
+vissim:
+  enabled: true
+
+  # Strip attributes absent from the OpenDRIVE 1.4 schema that Vissim's
+  # import validation would flag: road@rule, lane@rule (CARLA LHT
+  # extensions) and access@rule (OpenDRIVE 1.6 syntax).
+  strip_nonstandard_attributes: true
+
+  # paramPoly3 parameter convention:
+  #   normalized — re-parameterize coefficients to p in [0, 1] exactly and
+  #                drop the non-1.4 pRange attribute (schema-clean).
+  #   arcLength  — keep the emitted coefficients and pRange attribute.
+  # Verify with a one-off Vissim import test which convention its parser
+  # assumes (docs/vissim-compatibility.md, "Open items").
+  param_poly3_p_range: "normalized"
+
+  # Replace the header geoReference with a PROJ string describing the
+  # exported local frame so Vissim places the network correctly on its
+  # background map (issue #550).
+  local_geo_reference: true

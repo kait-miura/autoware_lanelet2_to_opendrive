@@ -1,0 +1,282 @@
+"""Tests for the PTV Vissim export profile (``vissim_profile``).
+
+Covers the three write-time transformations (rule-attribute stripping,
+paramPoly3 re-parameterization, geoReference replacement), the import risk
+report, and the local-frame PROJ string — including a frame-alignment check
+against the actual projectors used by the converter.
+"""
+
+import math
+
+import lxml.etree as ET
+import pytest
+
+from autoware_lanelet2_to_opendrive.vissim_profile import (
+    VissimConfig,
+    apply_vissim_profile,
+    evaluate_param_poly3,
+    local_frame_proj_string,
+)
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _sample_tree() -> ET._Element:
+    """A miniature OpenDRIVE tree with every construct the profile edits."""
+    xml = """
+    <OpenDRIVE>
+      <header revMajor="1" revMinor="4" name="t">
+        <geoReference><![CDATA[+proj=utm +zone=54 +lat_0=35.0 +lon_0=139.8 +datum=WGS84 +units=m +no_defs]]></geoReference>
+      </header>
+      <road id="1" length="10.0" junction="-1" rule="LHT">
+        <planView>
+          <geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="4.0">
+            <paramPoly3 aU="0.0" bU="1.0" cU="0.01" dU="0.001"
+                        aV="0.0" bV="0.0" cV="0.02" dV="-0.002"
+                        pRange="arcLength"/>
+          </geometry>
+          <geometry s="4.0" x="4.0" y="0.0" hdg="0.0" length="6.0">
+            <line/>
+          </geometry>
+        </planView>
+        <lanes>
+          <laneSection s="0.0">
+            <left>
+              <lane id="1" type="driving" level="false" rule="LHT">
+                <width sOffset="0.0" a="3.0" b="0.0" c="0.0" d="0.0"/>
+                <access sOffset="0.0" rule="allow" restriction="passengerCar"/>
+              </lane>
+              <lane id="2" type="sidewalk" level="false">
+                <width sOffset="0.0" a="0.4" b="0.0" c="0.0" d="0.0"/>
+              </lane>
+            </left>
+            <center>
+              <lane id="0" type="none" level="false"/>
+            </center>
+          </laneSection>
+        </lanes>
+      </road>
+      <road id="2" length="0.01" junction="1000">
+        <planView>
+          <geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="0.01">
+            <line/>
+          </geometry>
+        </planView>
+        <lanes>
+          <laneSection s="0.0">
+            <left>
+              <lane id="1" type="driving" level="false">
+                <width sOffset="0.0" a="0.5" b="0.3" c="0.0" d="0.0"/>
+              </lane>
+            </left>
+            <center><lane id="0" type="none" level="false"/></center>
+          </laneSection>
+        </lanes>
+      </road>
+    </OpenDRIVE>
+    """
+    return ET.fromstring(xml.encode())
+
+
+# ---------------------------------------------------------------------------
+# VissimConfig validation
+# ---------------------------------------------------------------------------
+
+
+def test_config_rejects_unknown_p_range_mode():
+    with pytest.raises(ValueError, match="param_poly3_p_range"):
+        VissimConfig(param_poly3_p_range="bogus")
+
+
+# ---------------------------------------------------------------------------
+# rule attribute stripping
+# ---------------------------------------------------------------------------
+
+
+def test_strips_rule_attributes_from_road_lane_and_access():
+    root = _sample_tree()
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+
+    assert report.rule_attributes_stripped == 3
+    assert "rule" not in root.find("road").attrib
+    for lane in root.iter("lane"):
+        assert "rule" not in lane.attrib
+    for access in root.iter("access"):
+        assert "rule" not in access.attrib
+    # Non-rule attributes are untouched.
+    assert root.find("road").get("junction") == "-1"
+    assert root.find(".//access").get("restriction") == "passengerCar"
+
+
+def test_stripping_can_be_disabled():
+    root = _sample_tree()
+    apply_vissim_profile(
+        root,
+        VissimConfig(
+            enabled=True,
+            strip_nonstandard_attributes=False,
+            param_poly3_p_range="arcLength",
+        ),
+    )
+    assert root.find("road").get("rule") == "LHT"
+
+
+# ---------------------------------------------------------------------------
+# paramPoly3 re-parameterization
+# ---------------------------------------------------------------------------
+
+
+def test_normalized_mode_rescales_coefficients_exactly():
+    root = _sample_tree()
+    geometry = root.find(".//geometry")
+    length = float(geometry.get("length"))
+    poly = geometry.find("paramPoly3")
+    original = {k: float(poly.get(k)) for k in poly.keys() if k != "pRange"}
+
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+    assert report.param_poly3_reparameterized == 1
+    assert poly.get("pRange") is None
+
+    # The re-parameterized polynomial evaluated at p̂ = s / L must equal the
+    # original arc-length polynomial at s over the whole domain.
+    for prefix in ("U", "V"):
+        arc_coeffs = tuple(original[f"{c}{prefix}"] for c in "abcd")
+        norm_coeffs = tuple(float(poly.get(f"{c}{prefix}")) for c in "abcd")
+        for s in (0.0, 0.5, 1.7, length):
+            expected = evaluate_param_poly3(arc_coeffs, s)
+            actual = evaluate_param_poly3(norm_coeffs, s / length)
+            assert math.isclose(expected, actual, rel_tol=0.0, abs_tol=1e-12)
+
+
+def test_arc_length_mode_keeps_coefficients_and_attribute():
+    root = _sample_tree()
+    report = apply_vissim_profile(
+        root, VissimConfig(enabled=True, param_poly3_p_range="arcLength")
+    )
+    poly = root.find(".//paramPoly3")
+    assert report.param_poly3_reparameterized == 0
+    assert poly.get("pRange") == "arcLength"
+    assert float(poly.get("bU")) == 1.0
+
+
+def test_line_geometries_are_untouched():
+    root = _sample_tree()
+    apply_vissim_profile(root, VissimConfig(enabled=True))
+    lines = [g for g in root.iter("geometry") if g.find("line") is not None]
+    assert len(lines) == 2
+    for line_geom in lines:
+        assert line_geom.find("paramPoly3") is None
+
+
+# ---------------------------------------------------------------------------
+# geoReference replacement
+# ---------------------------------------------------------------------------
+
+
+def test_geo_reference_replaced_when_proj_provided():
+    root = _sample_tree()
+    proj = "+proj=tmerc +lat_0=0 +lon_0=141 +k=0.9996 +x_0=1.0 +y_0=2.0"
+    report = apply_vissim_profile(
+        root,
+        VissimConfig(enabled=True, local_geo_reference_proj=proj),
+    )
+    assert report.geo_reference_replaced
+    assert root.find("header/geoReference").text == proj
+
+
+def test_geo_reference_kept_without_proj_string():
+    root = _sample_tree()
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+    assert not report.geo_reference_replaced
+    assert "+proj=utm" in root.find("header/geoReference").text
+
+
+# ---------------------------------------------------------------------------
+# import risk report
+# ---------------------------------------------------------------------------
+
+
+def test_report_flags_short_roads_and_width_indicators():
+    root = _sample_tree()
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+
+    # Road 2 is 0.01 m long: below both thresholds.
+    assert report.roads_below_spline_spacing == ["2"]
+    assert report.roads_below_inserted_link_length == ["2"]
+
+    # Two driving lanes are checked (the 0.4 m sidewalk is ignored by
+    # Vissim and therefore not counted). Road 2's lane starts at 0.5 m.
+    assert report.checked_lanes == 2
+    assert report.lanes_below_min_width == 1
+    # Width swings: road 1 lane is constant; road 2 swings only
+    # 0.3 * 0.01 = 0.003 m over its length.
+    assert report.lanes_above_width_swing_threshold == 0
+
+
+# ---------------------------------------------------------------------------
+# local-frame PROJ string
+# ---------------------------------------------------------------------------
+
+
+def test_local_frame_proj_string_structure():
+    proj = local_frame_proj_string("54SUE", offset_x=92008.5, offset_y=45335.1)
+    assert "+proj=tmerc" in proj
+    assert "+lon_0=141" in proj  # zone 54 central meridian
+    assert "+k=0.9996" in proj
+    assert "+datum=WGS84" in proj
+    # Northern hemisphere: y_0 = -N0 must be negative, x_0 = 500000 - E0.
+    x_0 = float(proj.split("+x_0=")[1].split()[0])
+    y_0 = float(proj.split("+y_0=")[1].split()[0])
+    assert y_0 < 0
+    # E0 within zone: x_0 + E0 == 500000 with E0 = corner + offset.
+    e0 = 500000.0 - x_0
+    n0 = -y_0
+    assert e0 % 100000 == pytest.approx(92008.5, abs=1e-6)
+    assert n0 % 100000 == pytest.approx(45335.1, abs=1e-6)
+
+
+def test_local_frame_proj_string_rejects_invalid_code():
+    with pytest.raises(ValueError, match="Invalid MGRS"):
+        local_frame_proj_string("not-a-grid")
+
+
+def test_local_frame_matches_converter_projection():
+    """local(0,0) really is the point (E0, N0): the profile's frame model
+    must agree with the MGRSProjector + offset pipeline the converter uses."""
+    import lanelet2
+    from autoware_lanelet2_extension_python.projection import MGRSProjector
+
+    from autoware_lanelet2_to_opendrive.projection import (
+        mgrs_grid_with_offset_to_lanelet2_origin,
+    )
+
+    mgrs_code = "54SUE"
+    offset_x, offset_y = 92008.5, 45335.1
+
+    proj = local_frame_proj_string(mgrs_code, offset_x, offset_y)
+    x_0 = float(proj.split("+x_0=")[1].split()[0])
+    y_0 = float(proj.split("+y_0=")[1].split()[0])
+    e0 = 500000.0 - x_0
+    n0 = -y_0
+
+    origin = mgrs_grid_with_offset_to_lanelet2_origin(mgrs_code, offset_x, offset_y)
+    mgrs_projector = MGRSProjector(origin)
+    utm_projector = lanelet2.projection.UtmProjector(origin, False, False)
+
+    # Probe points spread over a few hundred metres around the origin.
+    for dlat, dlon in ((0.0, 0.0), (0.003, 0.0), (0.0, 0.004), (-0.002, 0.003)):
+        gps = lanelet2.core.GPSPoint(
+            origin.position.lat + dlat, origin.position.lon + dlon, 0.0
+        )
+        local = mgrs_projector.forward(gps)
+        local_x = local.x - offset_x
+        local_y = local.y - offset_y
+        absolute = utm_projector.forward(gps)
+        # absolute UTM == local + (E0, N0); the MGRS truncation in
+        # mgrs_grid_with_offset_to_latlon rounds the origin to whole
+        # metres, so allow that much slack.
+        assert absolute.x - local_x == pytest.approx(e0, abs=1.0)
+        assert absolute.y - local_y == pytest.approx(n0, abs=1.0)

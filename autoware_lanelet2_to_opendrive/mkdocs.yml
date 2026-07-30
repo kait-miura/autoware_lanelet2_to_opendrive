@@ -78,6 +78,7 @@ nav:
   - Installation: installation.md
   - Usage: usage.md
   - CARLA OpenDRIVE Mapping: carla_opendrive_lanelet2_mapping.md
+  - Vissim Compatibility: vissim-compatibility.md
   - Known Limitations:
     - Overview: limitations/index.md
     - Stop Line Position: limitations/stop-line-position.md

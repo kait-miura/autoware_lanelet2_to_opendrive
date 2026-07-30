@@ -632,6 +632,11 @@ def _evaluate_road_xy(
 
     # Reference-line point and tangent heading, per geometry type.
     if isinstance(geom, ParamPoly3):
+        # Normalized paramPoly3 (Vissim export profile output) is defined
+        # over p̂ ∈ [0, 1]; rescale the arc-length parameter. The tangent
+        # direction is unaffected (du and dv scale uniformly).
+        if geom.pRange == "normalized" and geom.length > 0.0:
+            p = p / geom.length
         x_ref, y_ref = evaluate_plan_view_world(
             geom.x,
             geom.y,

@@ -85,6 +85,10 @@ from autoware_lanelet2_to_opendrive.conversion_config import (
 from autoware_lanelet2_to_opendrive.opendrive.parking import (
     construct_parking_roads,
 )
+from autoware_lanelet2_to_opendrive.vissim_profile import (
+    VissimConfig,
+    local_frame_proj_string,
+)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -2130,9 +2134,23 @@ class _Lanelet2ToOpenDRIVEConverter:
 
         logger.info("Conversion completed successfully!")
 
+        # Consumer-specific export profile (PTV Vissim): applied to the
+        # serialized XML tree at write time so the conversion pipeline and
+        # other targets (CARLA, Foretify preflight) stay untouched.
+        postprocess = None
+        if self.config.vissim.enabled:
+            from .vissim_profile import apply_vissim_profile
+
+            vissim_config = self.config.vissim
+
+            def postprocess(xml_root):  # noqa: ANN001 - lxml element
+                apply_vissim_profile(xml_root, vissim_config).log(logger)
+
         # Save to file if output path is provided
         if self.config.output_path:
-            save_opendrive_to_file(opendrive, self.config.output_path)
+            save_opendrive_to_file(
+                opendrive, self.config.output_path, postprocess=postprocess
+            )
             print(f"OpenDRIVE file saved to: {self.config.output_path}")
 
         return opendrive
@@ -2881,6 +2899,49 @@ def preprocess_and_convert_with_hydra(
     )
     logger.info(f"Emission geometry config: enabled={emission_config.enabled}")
 
+    # Build VissimConfig from Hydra config (PTV Vissim export profile)
+    # Priority: map config > target config > default
+    vissim_dict = cfg.map.get("vissim") or cfg.target.get("vissim", {})
+    vissim_config = VissimConfig(
+        enabled=vissim_dict.get("enabled", False) if vissim_dict else False,
+        strip_nonstandard_attributes=(
+            vissim_dict.get("strip_nonstandard_attributes", True)
+            if vissim_dict
+            else True
+        ),
+        param_poly3_p_range=(
+            vissim_dict.get("param_poly3_p_range", "normalized")
+            if vissim_dict
+            else "normalized"
+        ),
+        local_geo_reference=(
+            vissim_dict.get("local_geo_reference", True) if vissim_dict else True
+        ),
+    )
+    if vissim_config.enabled and vissim_config.local_geo_reference:
+        # The local-frame PROJ string needs the resolved MGRS grid and the
+        # raw (un-truncated) map offsets, which only exist at this layer.
+        try:
+            vissim_config.local_geo_reference_proj = local_frame_proj_string(
+                resolved.mgrs_code or "",
+                resolved.offset_x,
+                resolved.offset_y,
+            )
+        except ValueError as exc:
+            logger.warning(
+                "Vissim profile: could not derive the local-frame "
+                "geoReference (%s); the default geoReference is kept.",
+                exc,
+            )
+    if vissim_config.enabled:
+        logger.info(
+            "Vissim export profile enabled: strip_nonstandard_attributes=%s, "
+            "param_poly3_p_range=%s, local_geo_reference=%s",
+            vissim_config.strip_nonstandard_attributes,
+            vissim_config.param_poly3_p_range,
+            vissim_config.local_geo_reference_proj is not None,
+        )
+
     # Build ConversionConfig from parameters
     conversion_config = ConversionConfig(
         output_path=output_file,
@@ -2899,6 +2960,7 @@ def preprocess_and_convert_with_hydra(
         parking_lot=parking_config,
         signal=signal_config,
         emission_geometry=emission_config,
+        vissim=vissim_config,
     )
 
     # mgrs_code is already stored in conversion_config.origin.mgrs_code;

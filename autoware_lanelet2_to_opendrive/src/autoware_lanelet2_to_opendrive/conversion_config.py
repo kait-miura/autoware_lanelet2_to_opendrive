@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
 from lanelet2.routing import RoutingGraph
 
+from .vissim_profile import VissimConfig
+
 
 DEFAULT_SIGNAL_COUNTRY = "DE"
 
@@ -277,6 +279,8 @@ class ConversionConfig:
             and the geometry parameters used for stall sizing and association.
         signal: Configuration for OpenDRIVE signal generation.
         emission_geometry: Optional post-freeze physical geometry emission.
+        vissim: PTV Vissim export profile (write-time post-processing).
+            Disabled by default; enabled by the ``target=vissim`` config.
     """
 
     output_path: Optional[Path] = None
@@ -296,6 +300,7 @@ class ConversionConfig:
     emission_geometry: EmissionGeometryConfig = field(
         default_factory=EmissionGeometryConfig
     )
+    vissim: VissimConfig = field(default_factory=VissimConfig)
 
     def __post_init__(self):
         """Validate configuration after initialization."""
