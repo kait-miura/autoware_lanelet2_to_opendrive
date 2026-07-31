@@ -299,6 +299,36 @@ class JunctionEmissionConstants:
 
 
 @dataclass(frozen=True)
+class VissimTopologyConstants:
+    """Thresholds for the Vissim overlap diagnostics.
+
+    ``lateral_tolerance`` is the criterion the merge and collapse passes act
+    on. It measures the distance between two *lane centres*, which is a
+    different quantity from the overlap Vissim tests: for two lanes of width
+    ``w1`` and ``w2`` the surfaces overlap by ``(w1 + w2) / 2 - d``, so a
+    0.5 m surface overlap corresponds to a 3.0 m centre distance at 3.5 m
+    lanes. The value is kept at its original 1.5 m ("roughly half a lane")
+    until measurement settles which reading of the Vissim rule applies.
+
+    ``conflict_overlap_width`` and ``conflict_overlap_length`` are the two
+    candidate readings of PTV's "overlap of 0.5 m or less raises no conflict
+    area": the lateral width of the overlapping surface, or the longitudinal
+    length of the stretch over which the surfaces overlap at all. Both are
+    recorded by :func:`~..vissim_topology.measure_stream_overlap`; neither
+    drives a decision.
+
+    ``conflict_exemption_distance`` is PTV's third exemption — no conflict
+    area arises when, within this distance of where the overlap begins, one of
+    the links ends and no connector starts there.
+    """
+
+    lateral_tolerance: float = 1.5
+    conflict_overlap_width: float = 0.5
+    conflict_overlap_length: float = 0.5
+    conflict_exemption_distance: float = 5.0
+
+
+@dataclass(frozen=True)
 class ConversionConstants:
     """Main container for all internal constants used in the conversion process.
 
@@ -340,6 +370,7 @@ class ConversionConstants:
         parampoly3: ParamPoly3 geometry generation constants
         arcspiral: Arc/spiral classifier internal tunables
         junction_emission: Junction-wide topology/geometry planning constants
+        vissim_topology: Vissim overlap-diagnostic thresholds
     """
 
     geometry: GeometryConstants = GeometryConstants()
@@ -350,6 +381,7 @@ class ConversionConstants:
     parampoly3: ParamPoly3Constants = ParamPoly3Constants()
     arcspiral: ArcSpiralConstants = ArcSpiralConstants()
     junction_emission: JunctionEmissionConstants = JunctionEmissionConstants()
+    vissim_topology: VissimTopologyConstants = VissimTopologyConstants()
 
 
 @dataclass

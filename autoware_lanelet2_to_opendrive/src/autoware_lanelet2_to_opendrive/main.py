@@ -2593,11 +2593,15 @@ class _Lanelet2ToOpenDRIVEConverter:
                 absorb_degenerate_stubs,
                 align_connector_elevations,
                 analyze_topology,
+                collapse_lane_choice_fans,
                 dissolve_non_intersection_junctions,
+                link_isolated_roads,
                 merge_consecutive_roads,
                 merge_parallel_lane_roads,
                 omit_unimported_roads,
                 reciprocate_lane_links,
+                write_overlap_measurements,
+                write_vissim_mapping,
             )
 
             print("\n=== Vissim topology pass ===")
@@ -2664,6 +2668,31 @@ class _Lanelet2ToOpenDRIVEConverter:
                         group.base_road_id,
                         group.lane_count,
                     )
+            if self.config.vissim.collapse_lane_choice_fans:
+                fans = collapse_lane_choice_fans(
+                    final_roads,
+                    junctions,
+                    lanelet_to_road_and_lane=lanelet_to_road_and_lane,
+                    lanelet_to_emitted_segments=mapping.lanelet_to_emitted_segments,
+                )
+                for fan in fans:
+                    logger.info(
+                        "Vissim topology: collapsed lane-choice fan on road %d "
+                        "lane %d -> road %d to road %d, dropping %s — the "
+                        "branches overlap because they are one path drawn once "
+                        "per destination lane; %s now start with no "
+                        "predecessor and are entered by changing lanes",
+                        fan.predecessor_road_id,
+                        fan.predecessor_lane_id,
+                        fan.successor_road_id,
+                        fan.kept_road_id,
+                        fan.dropped_road_ids,
+                        ", ".join(
+                            f"road {rid} lane {lid}"
+                            for rid, lid in fan.lane_change_targets
+                        )
+                        or "no lane",
+                    )
             if self.config.vissim.merge_consecutive_roads:
                 chains = merge_consecutive_roads(
                     final_roads,
@@ -2698,6 +2727,18 @@ class _Lanelet2ToOpenDRIVEConverter:
                             for rid, types, isolated in omitted
                         ),
                     )
+            if self.config.vissim.link_isolated_roads:
+                relinked = link_isolated_roads(final_roads)
+                for upstream, downstream, gap in relinked:
+                    logger.info(
+                        "Vissim topology: linked road %d -> road %d (endpoints "
+                        "%.3f m apart) — the vehicle routing graph never saw "
+                        "this succession because no vehicle rule admits the "
+                        "carriageway, so it arrived with no <link> at all",
+                        upstream,
+                        downstream,
+                        gap,
+                    )
             filled = reciprocate_lane_links(final_roads)
             if filled:
                 logger.info(
@@ -2707,6 +2748,46 @@ class _Lanelet2ToOpenDRIVEConverter:
                     filled,
                 )
             analyze_topology(final_roads, junctions).log(logger)
+            if self.config.vissim.vissim_mapping_csv and self.config.output_path:
+                # lanelet -> road/lane -> Vissim link name, with the projection
+                # offsets in the header so the coordinates can be put back on
+                # the source map's frame.
+                map_path = Path(self.config.output_path).with_suffix(
+                    ".vissim_mapping.csv"
+                )
+                written = write_vissim_mapping(
+                    map_path,
+                    final_roads,
+                    lanelet_to_road_and_lane,
+                    # COORDINATE_OFFSET is the global the exporter subtracts
+                    # from every coordinate; ProjectionMetadata is only built
+                    # later, when the sidecar is assembled.
+                    {
+                        "offset_x": COORDINATE_OFFSET.x,
+                        "offset_y": COORDINATE_OFFSET.y,
+                        "offset_z": COORDINATE_OFFSET.z,
+                    },
+                )
+                logger.info(
+                    "Vissim topology: wrote %d lanelet correspondence row(s) to "
+                    "%s (lanelet -> road/lane -> Vissim link name, projection "
+                    "offsets in the header)",
+                    written,
+                    map_path,
+                )
+            if self.config.vissim.overlap_measurement_csv and self.config.output_path:
+                # Diagnostic sidecar. Records every reading of "these roads
+                # overlap" so the Vissim rule can be settled by measurement;
+                # nothing above consults it.
+                csv_path = Path(self.config.output_path).with_suffix(".overlap.csv")
+                written = write_overlap_measurements(csv_path, final_roads, junctions)
+                logger.info(
+                    "Vissim topology: wrote %d overlap measurement row(s) to %s "
+                    "— the merge decision still uses the lane-centre criterion "
+                    "only; interpretation_x/y are recorded, not applied",
+                    written,
+                    csv_path,
+                )
 
         # Step 7: Write OpenDRIVE output
         opendrive = self._write_opendrive_output(
@@ -3065,7 +3146,7 @@ def preprocess_and_convert_with_hydra(
             vissim_dict.get("absorb_stub_max_length", 3.0) if vissim_dict else 3.0
         ),
         omit_unimported_roads=(
-            vissim_dict.get("omit_unimported_roads", True) if vissim_dict else True
+            vissim_dict.get("omit_unimported_roads", False) if vissim_dict else False
         ),
         align_connector_lanes=(
             vissim_dict.get("align_connector_lanes", True) if vissim_dict else True
@@ -3080,6 +3161,23 @@ def preprocess_and_convert_with_hydra(
         ),
         merge_consecutive_roads=(
             vissim_dict.get("merge_consecutive_roads", True) if vissim_dict else True
+        ),
+        collapse_lane_choice_fans=(
+            vissim_dict.get("collapse_lane_choice_fans", False)
+            if vissim_dict
+            else False
+        ),
+        overlap_measurement_csv=(
+            vissim_dict.get("overlap_measurement_csv", True) if vissim_dict else True
+        ),
+        vissim_mapping_csv=(
+            vissim_dict.get("vissim_mapping_csv", True) if vissim_dict else True
+        ),
+        link_isolated_roads=(
+            vissim_dict.get("link_isolated_roads", True) if vissim_dict else True
+        ),
+        clip_false_lane_overlaps=(
+            vissim_dict.get("clip_false_lane_overlaps", False) if vissim_dict else False
         ),
     )
     if vissim_config.enabled and vissim_config.local_geo_reference:

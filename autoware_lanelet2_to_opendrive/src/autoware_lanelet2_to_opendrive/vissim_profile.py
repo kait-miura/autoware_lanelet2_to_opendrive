@@ -29,6 +29,7 @@ tree — without touching the conversion pipeline — so that other targets
   threshold).
 """
 
+import itertools
 import logging
 import math
 import re
@@ -131,6 +132,48 @@ class VissimConfig:
             arrive in Vissim as fragments where a connector belongs; joining
             the neighbours hands the stretch back to one. Applied in the
             pipeline by ``vissim_topology``.
+        overlap_measurement_csv: Write an ``<output>.overlap.csv`` sidecar
+            recording every reading of "these two roads overlap" — the
+            lane-centre criterion the passes act on, the lateral overlap width,
+            the longitudinal overlap length, and PTV's ending-road exemption.
+            Purely diagnostic: no pass consults it, and which reading of the
+            Vissim rule applies is still open.
+        collapse_lane_choice_fans: Disabled by default — see the note below.
+            Reduce branches that share an upstream lane
+            and a downstream road, differing only in the lane they land in, to
+            the single path Vissim can represent. Lanelet2 draws "this lane may
+            end up in any of those lanes" as one lanelet per destination, all
+            leaving the same cross-section, so the transcription lays several
+            roads on top of one another and Vissim raises a conflict area for
+            every overlapping pair. The abandoned downstream lanes keep their
+            traffic: an OpenDRIVE lane may start with no predecessor and be
+            entered by changing lanes, which is what a turn pocket is. That is
+            also why it is off: the movement into an abandoned lane becomes a
+            lane change, and in Vissim a right turn then crosses three lanes at
+            once. Overlapping geometry a modeller can resolve; a turn that has
+            to cross three lanes cannot.
+        vissim_mapping_csv: Write an ``<output>.vissim_mapping.csv`` sidecar
+            giving, per lanelet, the road and lane it became and the name Vissim
+            will show for that road, with the projection offsets in the header.
+            Vissim's own link numbering is assigned at import, but it reports our
+            road id as the middle field of every link label, which is what makes
+            the correspondence resolvable.
+        link_isolated_roads: Assert the succession of roads the vehicle routing
+            graph never saw. Links come from a routing graph built for a vehicle
+            participant, so a shoulder or bicycle carriageway arrives with no
+            ``<link>`` at all even where the source lanelets share a boundary
+            and continue one another — four such successions on the Odaiba clip,
+            each rendering as a floating patch. Only roads with no link on either
+            end are touched.
+        clip_false_lane_overlaps: Narrow constant lane widths that make the
+            lanes of two different roads overlap on paper. The constant is the
+            lane's arc-length mean width, so wherever the lane is genuinely
+            narrower the emitted surface is too wide and neighbouring lanes
+            cross for no physical reason — Vissim then raises a conflict area
+            between lanes no vehicle can occupy at once. Pairs whose centres
+            are closer than 1.5 m are left alone: those are roads genuinely
+            laid on top of one another, a topology defect that must stay
+            visible.
         align_connector_lanes: Slide each connecting road sideways so its lane
             meets the lane it links to. Constant-izing widths moves a lane
             centre — the further from the reference line the more — so the
@@ -164,11 +207,16 @@ class VissimConfig:
     elevation_baseline: Union[str, float] = "min"
     absorb_degenerate_stubs: bool = True
     absorb_stub_max_length: float = 3.0
-    omit_unimported_roads: bool = True
+    omit_unimported_roads: bool = False
     align_connector_lanes: bool = True
+    link_isolated_roads: bool = True
+    vissim_mapping_csv: bool = True
+    clip_false_lane_overlaps: bool = False
     untag_straight_turn_lanelets: bool = True
     merge_parallel_lane_roads: bool = True
     merge_consecutive_roads: bool = True
+    collapse_lane_choice_fans: bool = False
+    overlap_measurement_csv: bool = True
 
     def __post_init__(self) -> None:
         if self.param_poly3_p_range not in _P_RANGE_MODES:
@@ -195,6 +243,9 @@ class VissimProfileReport:
     junctions_merged: int = 0
     elevation_shift: Optional[float] = None
     connectors_realigned: List[Tuple[str, float, float]] = field(default_factory=list)
+    false_overlaps_clipped: List[Tuple[str, str, float, float]] = field(
+        default_factory=list
+    )
     roads_below_spline_spacing: List[str] = field(default_factory=list)
     roads_below_inserted_link_length: List[str] = field(default_factory=list)
     lanes_below_min_width: int = 0
@@ -219,6 +270,15 @@ class VissimProfileReport:
                 else "nothing"
             ),
         )
+        if self.false_overlaps_clipped:
+            logger.info(
+                "Vissim profile: narrowed constant widths on %d road pair(s) "
+                "whose lanes only overlapped because the constant is the lane's "
+                "mean width — worst %.3f m of surface overlap removed; Vissim "
+                "raises a conflict area wherever two surfaces meet",
+                len(self.false_overlaps_clipped),
+                max(row[2] for row in self.false_overlaps_clipped),
+            )
         if self.connectors_realigned:
             worst = max(
                 self.connectors_realigned,
@@ -707,6 +767,169 @@ def _constantize_lane_widths(root: ET._Element) -> int:
     return constantized
 
 
+def _sample_lane_centres(road: ET._Element, count: int = 40):
+    """``[(x, y, heading, lane_id, width)]`` along every imported lane."""
+    geometries = road.findall("planView/geometry")
+    if not geometries:
+        return []
+    total = sum(float(g.get("length")) for g in geometries)
+    if total <= 0.0:
+        return []
+    section = road.find("lanes/laneSection")
+    if section is None:
+        return []
+    lanes = []
+    for side, sign in (("left", 1), ("right", -1)):
+        container = section.find(side)
+        if container is None:
+            continue
+        edge = 0.0
+        for lane in sorted(
+            container.findall("lane"), key=lambda e: sign * int(e.get("id"))
+        ):
+            width = lane.find("width")
+            value = float(width.get("a")) if width is not None else 0.0
+            if lane.get("type") in _VISSIM_IMPORTED_LANE_TYPES:
+                lanes.append((int(lane.get("id")), sign * (edge + value / 2.0), value))
+            edge += value
+    if not lanes:
+        return []
+    out = []
+    for index in range(count):
+        target = total * index / max(count - 1, 1)
+        walked = 0.0
+        for geometry in geometries:
+            length = float(geometry.get("length"))
+            if walked + length >= target - 1e-9:
+                x, y, heading = _road_frame(geometry, min(target - walked, length))
+                normal = (-math.sin(heading), math.cos(heading))
+                for lane_id, offset, width in lanes:
+                    out.append(
+                        (
+                            x + normal[0] * offset,
+                            y + normal[1] * offset,
+                            heading,
+                            lane_id,
+                            width,
+                        )
+                    )
+                break
+            walked += length
+    return out
+
+
+def _linked_road_pairs(root: ET._Element) -> set:
+    """Road id pairs that name each other, directly or through a junction."""
+    pairs = set()
+    for road in root.iter("road"):
+        link = road.find("link")
+        if link is None:
+            continue
+        for side in ("predecessor", "successor"):
+            end = link.find(side)
+            if end is not None and end.get("elementType") == "road":
+                pairs.add(frozenset((road.get("id"), end.get("elementId"))))
+    for junction in root.iter("junction"):
+        for connection in junction.findall("connection"):
+            pairs.add(
+                frozenset(
+                    (connection.get("incomingRoad"), connection.get("connectingRoad"))
+                )
+            )
+    return pairs
+
+
+def clip_false_lane_overlaps(
+    root: ET._Element,
+    *,
+    min_width: float = VISSIM_MIN_LANE_WIDTH,
+    min_centre_distance: float = 1.5,
+    max_heading_diff_deg: float = 45.0,
+) -> List[Tuple[str, str, float, float]]:
+    """Narrow constant widths that make neighbouring lanes overlap on paper.
+
+    Constant-izing a width sets it to the lane's arc-length mean, so wherever
+    the lane is genuinely narrower than that the emitted surface is too wide.
+    Two lanes of *different* roads whose centres keep their true spacing then
+    overlap for no physical reason — on the Odaiba clip connectors 63 and 64 run
+    2.93 m apart carrying 3.32 m and 3.27 m of width, so their surfaces cross by
+    0.36 m over 35 m. Vissim raises a conflict area wherever two link or
+    connector surfaces meet, which fills the network with priorities between
+    lanes no vehicle can be in at once.
+
+    Two guards keep it from trimming a width that is not the problem. Roads
+    that name each other — directly or through a junction — are skipped
+    outright: they meet at a joint, where their lanes approach by design, and a
+    station-sampled distance test is too coarse to tell that from an overlay
+    (it cost road 15 lane 2 and road 16 lane 1 more than 1.5 m each before this
+    guard existed). Of the rest, only pairs whose centres stay at least
+    ``min_centre_distance`` apart are touched, which is what distinguishes
+    "adjacent lanes, widths too generous" from two roads genuinely laid on top
+    of one another — a topology defect that must stay visible. Widths shrink in
+    proportion and never below Vissim's 1 m clamp, which would undo the change.
+
+    Returns ``(road_a, road_b, overlap_before, overlap_after)`` per pair fixed.
+    """
+    roads = [road for road in root.iter("road")]
+    samples = {road.get("id"): _sample_lane_centres(road) for road in roads}
+    widths: dict = {}
+    for road in roads:
+        for lane in road.iter("lane"):
+            width = lane.find("width")
+            if width is not None and lane.get("type") in _VISSIM_IMPORTED_LANE_TYPES:
+                widths[(road.get("id"), int(lane.get("id")))] = width
+
+    limit = math.radians(max_heading_diff_deg)
+    linked = _linked_road_pairs(root)
+    fixed: List[Tuple[str, str, float, float]] = []
+    for first, second in itertools.combinations(roads, 2):
+        if frozenset((first.get("id"), second.get("id"))) in linked:
+            continue
+        worst = 0.0
+        worst_key = None
+        for xa, ya, ha, la, wa in samples.get(first.get("id"), []):
+            for xb, yb, hb, lb, wb in samples.get(second.get("id"), []):
+                delta = abs((hb - ha + math.pi) % (2 * math.pi) - math.pi)
+                if delta > limit:
+                    continue
+                distance = math.hypot(xa - xb, ya - yb)
+                if distance < min_centre_distance:
+                    # Genuinely stacked: a topology defect, not a width to trim.
+                    worst_key = None
+                    worst = 0.0
+                    break
+                overlap = (wa + wb) / 2.0 - distance
+                if overlap > worst:
+                    worst, worst_key = overlap, (la, lb, wa, wb, distance)
+            else:
+                continue
+            break
+        if worst <= 0.0 or worst_key is None:
+            continue
+        la, lb, wa, wb, distance = worst_key
+        # Split the excess between the two lanes, in proportion to their width.
+        share = wa + wb
+        new_a = wa - worst * (wa / share) * 2.0
+        new_b = wb - worst * (wb / share) * 2.0
+        if new_a < min_width or new_b < min_width:
+            continue
+        element_a = widths.get((first.get("id"), la))
+        element_b = widths.get((second.get("id"), lb))
+        if element_a is None or element_b is None:
+            continue
+        element_a.set("a", str(new_a))
+        element_b.set("a", str(new_b))
+        fixed.append(
+            (
+                first.get("id"),
+                second.get("id"),
+                worst,
+                (new_a + new_b) / 2.0 - distance,
+            )
+        )
+    return fixed
+
+
 def _merge_overlapping_junctions(root: ET._Element) -> int:
     """Merge junctions whose connecting roads share a road attachment point.
 
@@ -874,6 +1097,8 @@ def apply_vissim_profile(
 
     if config.constant_lane_widths:
         report.lanes_width_constantized = _constantize_lane_widths(root)
+        if config.clip_false_lane_overlaps:
+            report.false_overlaps_clipped = clip_false_lane_overlaps(root)
         if config.align_connector_lanes:
             report.connectors_realigned = align_connector_lanes(root)
 

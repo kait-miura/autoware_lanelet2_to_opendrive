@@ -20,6 +20,7 @@ from autoware_lanelet2_to_opendrive.opendrive.junction import (
     Connection,
     Junction,
     LaneLink,
+    Priority,
 )
 from autoware_lanelet2_to_opendrive.opendrive.lane import Lane
 from autoware_lanelet2_to_opendrive.opendrive.lane_elements import (
@@ -38,12 +39,21 @@ from autoware_lanelet2_to_opendrive.opendrive.elevation import (
     Elevation,
     ElevationProfile,
 )
+from autoware_lanelet2_to_opendrive.config import DEFAULT_CONFIG
 from autoware_lanelet2_to_opendrive.vissim_topology import (
+    OVERLAP_CSV_COLUMNS,
+    _LATERAL_TOLERANCE,
     _same_stream_coverage,
+    conflict_area_exempted_by_road_end,
+    measure_overlap_table,
+    measure_stream_overlap,
+    write_overlap_measurements,
     absorb_degenerate_stubs,
     align_connector_elevations,
     analyze_topology,
+    collapse_lane_choice_fans,
     dissolve_non_intersection_junctions,
+    link_isolated_roads,
 )
 
 
@@ -1141,3 +1151,470 @@ def test_connecting_roads_are_excluded_from_the_overlap_check():
         road.junction = 1000
 
     assert analyze_topology(roads, []).overlapping_roads == []
+
+
+# ---------------------------------------------------------------------------
+# collapse_lane_choice_fans
+# ---------------------------------------------------------------------------
+
+
+def _branch(
+    road_id: int,
+    *,
+    y: float,
+    upstream: int,
+    upstream_lane: int,
+    downstream: int,
+    downstream_lanes,
+    length: float = 40.0,
+    lane_widths=(3.5,),
+) -> Road:
+    """A road bridging one upstream lane to ``downstream_lanes``."""
+    road = _road(road_id, x=0.0, y=y, hdg=0.0, length=length, lane_widths=lane_widths)
+    road.link = RoadLink(
+        predecessor=Predecessor(ElementType.ROAD, upstream, ContactPoint.END),
+        successor=Successor(ElementType.ROAD, downstream, ContactPoint.START),
+    )
+    for lane, target in zip(_ordered_lanes(road), downstream_lanes):
+        lane.predecessor = LaneElementLink(id=upstream_lane)
+        lane.successor = LaneElementLink(id=target)
+    return road
+
+
+def _ordered_lanes(road: Road):
+    assert road.lanes is not None
+    section = road.lanes.lane_sections[0]
+    return [section.left_lanes[key] for key in sorted(section.left_lanes)]
+
+
+def test_overlapping_lane_choice_fan_collapses_to_one_branch():
+    """Two branches of one lane onto one road, laid on top of one another."""
+    through = _branch(
+        2, y=0.0, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(1,)
+    )
+    pocket = _branch(
+        3, y=0.1, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(2,)
+    )
+    roads = [through, pocket]
+
+    fans = collapse_lane_choice_fans(roads, [])
+
+    assert len(fans) == 1
+    assert [road.id for road in roads] == [2]
+    assert fans[0].dropped_road_ids == [3]
+    assert fans[0].kept_road_id == 2
+    # The abandoned lane is now reached by changing lanes on road 9.
+    assert fans[0].lane_change_targets == [(9, 2)]
+
+
+def test_genuine_diverge_to_different_roads_is_kept():
+    """One lane splitting to two roads is a diverge, not a lane choice."""
+    roads = [
+        _branch(
+            2, y=0.0, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(1,)
+        ),
+        _branch(
+            3, y=0.1, upstream=1, upstream_lane=1, downstream=10, downstream_lanes=(1,)
+        ),
+    ]
+
+    assert collapse_lane_choice_fans(roads, []) == []
+    assert [road.id for road in roads] == [2, 3]
+
+
+def test_branches_that_separate_immediately_are_kept():
+    """Same ends, but physically distinct carriageways stay distinct."""
+    roads = [
+        _branch(
+            2, y=0.0, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(1,)
+        ),
+        _branch(
+            3, y=40.0, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(2,)
+        ),
+    ]
+
+    assert collapse_lane_choice_fans(roads, []) == []
+    assert [road.id for road in roads] == [2, 3]
+
+
+def test_overlapping_branches_collapse_whatever_lane_they_draw_from():
+    """Stacked roads between one pair of endpoints are unrepresentable.
+
+    Even drawing from different upstream lanes, both name road 9 as their
+    successor while it can name only one predecessor, so one claim is lost. The
+    lanes that genuinely sit side by side are kept — see the test below, where
+    they are a lane width apart instead of 0.1 m.
+    """
+    roads = [
+        _branch(
+            2, y=0.0, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(1,)
+        ),
+        _branch(
+            3, y=0.1, upstream=1, upstream_lane=2, downstream=9, downstream_lanes=(2,)
+        ),
+    ]
+
+    fans = collapse_lane_choice_fans(roads, [])
+
+    assert len(fans) == 1
+    assert [road.id for road in roads] == [2]
+
+
+def test_survivor_is_the_branch_carrying_the_most_lanes():
+    """Odaiba's road 16 (3 lanes) outranks road 17 (1 lane to the pocket)."""
+    pocket = _branch(
+        17, y=0.0, upstream=34, upstream_lane=1, downstream=15, downstream_lanes=(1,)
+    )
+    carriageway = _branch(
+        16,
+        y=0.1,
+        upstream=34,
+        upstream_lane=1,
+        downstream=15,
+        downstream_lanes=(2, 3, 4),
+        lane_widths=(3.5, 3.5, 3.5),
+    )
+    roads = [pocket, carriageway]
+
+    fans = collapse_lane_choice_fans(roads, [])
+
+    assert fans[0].kept_road_id == 16
+    assert [road.id for road in roads] == [16]
+
+
+def test_collapse_repoints_references_at_the_surviving_branch():
+    """A neighbour naming the dropped branch must not be left stranded.
+
+    On the Odaiba clip road 27 named road 28 as its predecessor; clearing that
+    reference left it with a link on neither end, so the omit pass discarded it
+    as isolated. The surviving branch bridges the same endpoints, so the
+    neighbour is retargeted at it and its lane correspondence restated.
+    """
+    through = _branch(
+        2, y=0.0, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(1,)
+    )
+    pocket = _branch(
+        3, y=0.1, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(2,)
+    )
+    downstream = _road(9, x=40.0, y=0.0, hdg=0.0, length=30.0, lane_widths=(3.5, 3.5))
+    downstream.link = RoadLink(
+        predecessor=Predecessor(ElementType.ROAD, 3, ContactPoint.END)
+    )
+    roads = [through, pocket, downstream]
+    junction = _junction(1000, (1, 3))
+
+    collapse_lane_choice_fans(roads, [junction])
+
+    assert [road.id for road in roads] == [2, 9]
+    # Retargeted at the survivor, not cleared.
+    assert downstream.link.predecessor.element_id == 2
+    # ... and lane 1 of road 9 restated against road 2's own lane link.
+    assert _ordered_lanes(downstream)[0].predecessor.id == 1
+    assert junction.connections == []
+
+
+def test_collapse_drops_the_mapping_of_the_dropped_branch():
+    """The reverse index may not point at a road that no longer exists."""
+    roads = [
+        _branch(
+            2, y=0.0, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(1,)
+        ),
+        _branch(
+            3, y=0.1, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(2,)
+        ),
+    ]
+    mapping = {1372: (2, 1), 1373: (3, 1)}
+    segments = {1372: [{"road_id": 2}], 1373: [{"road_id": 3}]}
+
+    collapse_lane_choice_fans(
+        roads,
+        [],
+        lanelet_to_road_and_lane=mapping,
+        lanelet_to_emitted_segments=segments,
+    )
+
+    assert mapping == {1372: (2, 1)}
+    assert segments == {1372: [{"road_id": 2}]}
+
+
+def test_three_way_fan_keeps_the_straight_continuation():
+    """Odaiba's 66/72/73: lane 1 to lanes 3/2/1 keeps the one landing in 1."""
+    roads = [
+        _branch(
+            66, y=0.0, upstream=6, upstream_lane=1, downstream=24, downstream_lanes=(3,)
+        ),
+        _branch(
+            72, y=0.1, upstream=6, upstream_lane=1, downstream=24, downstream_lanes=(2,)
+        ),
+        _branch(
+            73, y=0.2, upstream=6, upstream_lane=1, downstream=24, downstream_lanes=(1,)
+        ),
+    ]
+
+    fans = collapse_lane_choice_fans(roads, [])
+
+    assert fans[0].kept_road_id == 73
+    assert fans[0].dropped_road_ids == [66, 72]
+    assert fans[0].lane_change_targets == [(24, 2), (24, 3)]
+
+
+def test_fan_recognised_from_its_endpoint_pair_alone():
+    """Odaiba 36/37: the same shape, with lane links too sparse for the key.
+
+    Both roads bridge road 31 to road 32 while road 32 can name only one
+    predecessor, so one claim was already being lost. Road 36's lanes each draw
+    from a different upstream lane, so no single upstream lane identifies the
+    fan — the endpoint pair does.
+    """
+    carriageway = _branch(
+        36,
+        y=0.0,
+        upstream=31,
+        upstream_lane=1,
+        downstream=32,
+        downstream_lanes=(2, 3, 4),
+        lane_widths=(3.5, 3.5, 3.5),
+    )
+    for index, lane in enumerate(_ordered_lanes(carriageway), start=1):
+        lane.predecessor = LaneElementLink(id=index)
+    pocket = _branch(
+        37, y=0.5, upstream=31, upstream_lane=1, downstream=32, downstream_lanes=(1,)
+    )
+    roads = [carriageway, pocket]
+
+    fans = collapse_lane_choice_fans(roads, [])
+
+    assert len(fans) == 1
+    assert fans[0].kept_road_id == 36
+    assert fans[0].dropped_road_ids == [37]
+    assert [road.id for road in roads] == [36]
+
+
+def test_side_by_side_lanes_between_the_same_endpoints_are_kept():
+    """The endpoint-pair rule must not collapse an actual pair of lanes.
+
+    Two lanes of one carriageway also share both endpoints, but they sit a lane
+    width apart, so no station of one lands on a lane centre of the other.
+    """
+    left = _branch(
+        36, y=0.0, upstream=31, upstream_lane=1, downstream=32, downstream_lanes=(1,)
+    )
+    right = _branch(
+        37, y=-3.5, upstream=31, upstream_lane=2, downstream=32, downstream_lanes=(2,)
+    )
+    roads = [left, right]
+
+    assert collapse_lane_choice_fans(roads, []) == []
+    assert [road.id for road in roads] == [36, 37]
+
+
+# ---------------------------------------------------------------------------
+# measure_stream_overlap / overlap CSV — recorded, never acted on
+# ---------------------------------------------------------------------------
+
+
+def test_measurement_reproduces_the_decision_criterion_exactly():
+    """The recorded coverage must equal what the passes have always used."""
+    road = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    overlay = _connector(
+        2,
+        x=-1.0,
+        y=0.0,
+        hdg=0.0,
+        length=32.0,
+        junction=100,
+        predecessor=1,
+        successor=3,
+    )
+    assert measure_stream_overlap(road, overlay).coverage == pytest.approx(
+        _same_stream_coverage(road, overlay)
+    )
+
+
+def test_lateral_tolerance_comes_from_the_config():
+    """The threshold moved to config.py and kept its value."""
+    assert DEFAULT_CONFIG.vissim_topology.lateral_tolerance == 1.5
+    assert _LATERAL_TOLERANCE == DEFAULT_CONFIG.vissim_topology.lateral_tolerance
+
+
+def test_the_two_readings_disagree_for_grazing_carriageways():
+    """Lanes 3.0 m apart: surfaces graze, centres are far — X and Y split.
+
+    Two 3.5 m lanes 3.0 m apart overlap laterally by 0.5 m, which is exactly
+    the width threshold, so reading X stays false while the overlap runs the
+    whole length and reading Y is true. The current criterion is false too,
+    since 3.0 m exceeds the 1.5 m lane-centre tolerance — the pair is invisible
+    to the decision today, which is the case worth measuring.
+    """
+    road = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    grazing = _road(2, x=0.0, y=3.0, hdg=0.0, length=30.0)
+
+    measurement = measure_stream_overlap(road, grazing)
+
+    assert measurement.coverage == pytest.approx(0.0)
+    assert measurement.current_criterion is False
+    assert measurement.max_overlap_width == pytest.approx(0.5, abs=1e-6)
+    assert measurement.interpretation_x is False
+    assert measurement.overlap_length > 0.5
+    assert measurement.interpretation_y is True
+
+
+def test_stacked_carriageways_satisfy_both_readings():
+    road = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    stacked = _road(2, x=0.0, y=0.2, hdg=0.0, length=30.0)
+
+    measurement = measure_stream_overlap(road, stacked)
+
+    assert measurement.current_criterion is True
+    assert measurement.interpretation_x is True
+    assert measurement.interpretation_y is True
+    assert measurement.min_centre_distance == pytest.approx(0.2, abs=1e-6)
+
+
+def test_opposing_carriageway_is_measured_as_no_overlap():
+    """The direction gate applies to every reading, not just coverage."""
+    road = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    oncoming = _road(2, x=30.0, y=0.0, hdg=math.pi, length=30.0)
+
+    measurement = measure_stream_overlap(road, oncoming)
+
+    assert measurement.coverage == pytest.approx(0.0)
+    assert measurement.max_overlap_width == pytest.approx(0.0)
+    assert measurement.overlap_length == pytest.approx(0.0)
+
+
+def test_third_exemption_applies_when_a_road_ends_with_no_connector():
+    """A link ending inside the exemption distance and nothing picking it up."""
+    ending = _road(1, x=0.0, y=0.0, hdg=0.0, length=4.0)
+    ending.link = RoadLink()
+    alongside = _road(2, x=0.0, y=0.2, hdg=0.0, length=40.0)
+    alongside.link = RoadLink()
+
+    assert conflict_area_exempted_by_road_end(
+        ending, alongside, [ending, alongside], []
+    )
+
+
+def test_third_exemption_does_not_apply_when_a_connector_starts_there():
+    """Same geometry, but a connecting road continues past the end."""
+    ending = _road(1, x=0.0, y=0.0, hdg=0.0, length=4.0)
+    ending.link = RoadLink(successor=Successor(ElementType.ROAD, 3, ContactPoint.START))
+    alongside = _road(2, x=0.0, y=0.2, hdg=0.0, length=40.0)
+    alongside.link = RoadLink()
+    connector = _connector(
+        3,
+        x=4.0,
+        y=0.0,
+        hdg=0.0,
+        length=10.0,
+        junction=100,
+        predecessor=1,
+        successor=4,
+    )
+
+    assert not conflict_area_exempted_by_road_end(
+        ending, alongside, [ending, alongside, connector], []
+    )
+
+
+def test_third_exemption_does_not_apply_to_a_long_road():
+    """Nothing ends near where the overlap starts."""
+    first = _road(1, x=0.0, y=0.0, hdg=0.0, length=60.0)
+    first.link = RoadLink()
+    second = _road(2, x=0.0, y=0.2, hdg=0.0, length=60.0)
+    second.link = RoadLink()
+
+    assert not conflict_area_exempted_by_road_end(first, second, [first, second], [])
+
+
+def test_overlap_table_lists_a_pair_the_decision_ignores():
+    """The table's purpose: rows where the readings disagree with the decision."""
+    road = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    grazing = _road(2, x=0.0, y=3.0, hdg=0.0, length=30.0)
+
+    rows = measure_overlap_table([road, grazing], [])
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert (row["road_a"], row["road_b"]) == (1, 2)
+    assert row["current_criterion"] is False
+    assert row["interpretation_y"] is True
+    assert set(row) == set(OVERLAP_CSV_COLUMNS)
+
+
+def test_overlap_csv_has_the_declared_header(tmp_path):
+    road = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    stacked = _road(2, x=0.0, y=0.2, hdg=0.0, length=30.0)
+    target = tmp_path / "out.overlap.csv"
+
+    written = write_overlap_measurements(target, [road, stacked], [])
+
+    assert written == 1
+    header = target.read_text(encoding="utf-8").splitlines()[0]
+    assert header.split(",") == list(OVERLAP_CSV_COLUMNS)
+
+
+def test_collapse_prunes_priorities_naming_the_dropped_branch():
+    """``<priority>`` names connecting roads; a dropped one leaves it dangling.
+
+    On the Odaiba clip 13 of the junction's 22 priority records named roads
+    62/65/66/72 after they were collapsed away — a reference into nothing.
+    """
+    through = _branch(
+        2, y=0.0, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(1,)
+    )
+    pocket = _branch(
+        3, y=0.1, upstream=1, upstream_lane=1, downstream=9, downstream_lanes=(2,)
+    )
+    junction = _junction(1000, (1, 2), (1, 3))
+    junction.priorities = [Priority(high=2, low=3), Priority(high=3, low=2)]
+    roads = [through, pocket]
+
+    collapse_lane_choice_fans(roads, [junction])
+
+    assert [road.id for road in roads] == [2]
+    assert junction.priorities == []
+
+
+def test_isolated_roads_that_continue_each_other_are_linked():
+    """A shoulder chain arrives unlinked; its endpoints coincide exactly."""
+    upstream = _road(11, x=0.0, y=0.0, hdg=0.0, length=16.0)
+    downstream = _road(12, x=16.0, y=0.0, hdg=0.0, length=52.0)
+    roads = [upstream, downstream]
+
+    added = link_isolated_roads(roads)
+
+    assert added == [(11, 12, pytest.approx(0.0, abs=1e-6))]
+    assert upstream.link.successor.element_id == 12
+    assert downstream.link.predecessor.element_id == 11
+    assert _ordered_lanes(upstream)[0].successor.id == 1
+    assert _ordered_lanes(downstream)[0].predecessor.id == 1
+
+
+def test_roads_that_already_state_a_link_are_left_alone():
+    """Only the roads the conversion left with nothing are touched."""
+    upstream = _road(11, x=0.0, y=0.0, hdg=0.0, length=16.0)
+    upstream.link = RoadLink(
+        successor=Successor(ElementType.ROAD, 99, ContactPoint.START)
+    )
+    downstream = _road(12, x=16.0, y=0.0, hdg=0.0, length=52.0)
+
+    assert link_isolated_roads([upstream, downstream]) == []
+    assert upstream.link.successor.element_id == 99
+
+
+def test_isolated_roads_far_apart_are_not_linked():
+    roads = [
+        _road(11, x=0.0, y=0.0, hdg=0.0, length=16.0),
+        _road(12, x=40.0, y=0.0, hdg=0.0, length=52.0),
+    ]
+    assert link_isolated_roads(roads) == []
+
+
+def test_isolated_roads_facing_away_are_not_linked():
+    """The tangent gate: an oncoming shoulder is not a continuation."""
+    roads = [
+        _road(11, x=0.0, y=0.0, hdg=0.0, length=16.0),
+        _road(12, x=16.0, y=0.0, hdg=math.pi, length=52.0),
+    ]
+    assert link_isolated_roads(roads) == []

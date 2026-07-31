@@ -99,6 +99,31 @@ vissim:
   # so the merged road inherits them unchanged and no movement has to move.
   merge_parallel_lane_roads: true
 
+  # Collapse branches that share an upstream LANE and a downstream ROAD and
+  # differ only in the lane they land in. Lanelet2 draws "this lane may end up
+  # in any of those lanes" as one lanelet per destination, all leaving the same
+  # cross-section, so the transcription lays several roads on top of one
+  # another (Odaiba lanelets 1363/1372/1373 leave the same 3.63 m lane and stay
+  # within 0.10 m of each other for half their 60 m before splitting to three
+  # adjacent lanes). Vissim then raises a conflict area for every overlapping
+  # pair, filling the network with priorities where no two vehicles can meet;
+  # outside a junction the transcription is not even legal, since both roads
+  # named the same successor while it can only name one predecessor. The
+  # abandoned downstream lanes keep their traffic: an OpenDRIVE lane may start
+  # with no predecessor and be entered by changing lanes, which is precisely
+  # what a turn pocket is. A genuine diverge is untouched — its branches lead
+  # to different roads and separate immediately.
+  #
+  # DISABLED. Collapsing the fan removes the connector that fed each abandoned
+  # lane, so every movement into it becomes a lane change. In Vissim that shows
+  # up as vehicles crossing three lanes at once to make a right turn, because
+  # the route reaches the lane it needs only by changing lanes late. Keeping the
+  # duplicate branches costs overlapping geometry and the conflict areas that
+  # come with it, which a modeller can resolve in Vissim; a movement that has to
+  # cross three lanes cannot be resolved at all. Set to true only when the
+  # simpler network matters more than the turning movements.
+  collapse_lane_choice_fans: false
+
   # Autoware tags a turn lane from where its POCKET OPENS, not from where the
   # turn begins, but the converter reads turn_direction as "this lanelet is
   # inside an intersection". A straight pocket therefore becomes a connecting
@@ -120,7 +145,12 @@ vissim:
   # end, which would arrive as links floating unreachable. On the Odaiba clip
   # ten such roads have no <link> at all, which is why they render as
   # disconnected patches with gaps between them.
-  omit_unimported_roads: true
+  #
+  # DISABLED for faithful reproduction. Vissim ignores sidewalk and shoulder
+  # lane types either way, so dropping those roads buys nothing in Vissim while
+  # costing eleven lanelets their entry in the mapping sidecar. Set to true only
+  # when a tidy file matters more than the lanelet correspondence.
+  omit_unimported_roads: false
 
   # Replace stub roads with a direct link between their neighbours. Two
   # things leave stubs behind: the 0.01 m connecting roads the divergence
@@ -140,3 +170,57 @@ vissim:
   # plain widenings and off-ramps arrive as intersections. On the Odaiba
   # clip this reduces 7 junctions to the 1 real intersection.
   dissolve_non_intersection_junctions: true
+
+  # Write an "<output>.overlap.csv" sidecar recording every reading of "these
+  # two roads overlap": the lane-centre distance the merge and collapse passes
+  # act on, the lateral width of the overlapping surface (reading X of PTV's
+  # "overlap of 0.5 m or less raises no conflict area"), the longitudinal
+  # length of the overlapping stretch (reading Y), and whether PTV's third
+  # exemption applies — one link ending within 5 m of where the overlap starts
+  # with no connector picking it up. Purely diagnostic: the passes still decide
+  # on the lane-centre criterion alone, so enabling or disabling this changes
+  # no geometry. It exists so the two readings can be settled by importing the
+  # file into Vissim and comparing against the conflict areas it generates.
+  overlap_measurement_csv: true
+
+  # Narrow constant lane widths that make the lanes of two DIFFERENT roads
+  # overlap on paper. The constant is the lane's arc-length mean width, so
+  # wherever the lane is genuinely narrower the emitted surface is too wide and
+  # neighbouring lanes cross for no physical reason (Odaiba connectors 63 and 64
+  # run 2.93 m apart carrying 3.32 m and 3.27 m, so their surfaces cross by
+  # 0.36 m over 35 m). Vissim raises a conflict area wherever two link or
+  # connector surfaces meet, which is what fills the network with priorities
+  # between lanes no vehicle can be in at once. Pairs whose centres come closer
+  # than 1.5 m are left untouched: those roads are genuinely laid on top of one
+  # another, which is a topology defect and has to stay visible.
+  #
+  # DISABLED for faithful reproduction. It narrows a lane by up to 0.394 m, so
+  # the emitted width stops being the lane's true mean. The overlap it removes
+  # only affects the conflict areas Vissim generates, which a modeller resolves
+  # there; the width is source data. Set to true when the conflict-area count
+  # matters more than the widths.
+  clip_false_lane_overlaps: false
+
+  # Assert the succession of roads the vehicle routing graph never saw. Road
+  # links are derived from a routing graph built for a VEHICLE participant, so a
+  # shoulder or bicycle carriageway — which no vehicle traffic rule admits —
+  # arrives with no <link> at all even where the source lanelets share a
+  # boundary and plainly continue one another. On the Odaiba clip that left four
+  # successions unstated (roads 3->4 bicycle, 25->14, 11->12, 12->21 shoulder)
+  # whose endpoints coincide to 0.000 m, and each rendered as a patch floating
+  # on its own. Only roads with no link on either end are touched, so nothing
+  # the conversion did state can be disturbed. Vissim imports biking but not
+  # shoulder or sidewalk, so the visible effect there is limited to the bicycle
+  # chain; the lanelet correspondence gains all four.
+  link_isolated_roads: true
+
+  # Write an "<output>.vissim_mapping.csv" sidecar: one row per lanelet giving
+  # the road and lane it became, the lane type, whether Vissim imports that
+  # type, and the name Vissim will show for the road. Vissim assigns its own
+  # link numbers at import, so those cannot be predicted — but it reports OUR
+  # road id as the middle field of every link label ("5: 9: Road_9-0-Left" is
+  # Vissim link 5, our road 9), which is what makes the correspondence
+  # resolvable from either side. The projection offsets go in the header, since
+  # without them the emitted local coordinates cannot be put back on the source
+  # map's frame (x_absolute = x + offset_x).
+  vissim_mapping_csv: true

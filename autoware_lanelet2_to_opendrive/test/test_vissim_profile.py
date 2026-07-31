@@ -14,6 +14,7 @@ import pytest
 from autoware_lanelet2_to_opendrive.vissim_profile import (
     VissimConfig,
     apply_vissim_profile,
+    clip_false_lane_overlaps,
     evaluate_param_poly3,
     local_frame_proj_string,
 )
@@ -680,3 +681,108 @@ def test_alignment_can_be_disabled():
     )
     assert report.connectors_realigned == []
     assert root.find("road[@id='2']/planView/geometry").get("y") == "5.5"
+
+
+# ---------------------------------------------------------------------------
+# clip_false_lane_overlaps
+# ---------------------------------------------------------------------------
+
+
+def _two_parallel_roads(gap: float, width: float) -> ET._Element:
+    """Two single-lane roads whose centres are ``gap`` apart."""
+    root = ET.Element("OpenDRIVE")
+    for index, offset in enumerate((0.0, gap)):
+        road = ET.SubElement(
+            root, "road", id=str(index + 1), length="30.0", junction="-1"
+        )
+        plan = ET.SubElement(road, "planView")
+        geometry = ET.SubElement(
+            plan,
+            "geometry",
+            s="0.0",
+            x="0.0",
+            y=str(offset - width / 2.0),
+            hdg="0.0",
+            length="30.0",
+        )
+        ET.SubElement(geometry, "line")
+        lanes = ET.SubElement(road, "lanes")
+        section = ET.SubElement(lanes, "laneSection", s="0.0")
+        left = ET.SubElement(section, "left")
+        lane = ET.SubElement(left, "lane", id="1", type="driving")
+        ET.SubElement(lane, "width", sOffset="0.0", a=str(width), b="0", c="0", d="0")
+        ET.SubElement(section, "center")
+    return root
+
+
+def _width_of(root: ET._Element, road_id: str) -> float:
+    road = root.find(f"road[@id='{road_id}']")
+    return float(road.find(".//lane[@id='1']/width").get("a"))
+
+
+def test_adjacent_lanes_too_wide_are_narrowed():
+    """3.5 m lanes 2.9 m apart cross by 0.6 m; the excess is removed."""
+    root = _two_parallel_roads(gap=2.9, width=3.5)
+
+    fixed = clip_false_lane_overlaps(root)
+
+    assert len(fixed) == 1
+    road_a, road_b, before, after = fixed[0]
+    assert (road_a, road_b) == ("1", "2")
+    assert before == pytest.approx(0.6, abs=1e-6)
+    assert after <= 1e-9
+    assert _width_of(root, "1") == pytest.approx(2.9, abs=1e-6)
+    assert _width_of(root, "2") == pytest.approx(2.9, abs=1e-6)
+
+
+def test_properly_spaced_lanes_are_left_alone():
+    root = _two_parallel_roads(gap=3.6, width=3.5)
+
+    assert clip_false_lane_overlaps(root) == []
+    assert _width_of(root, "1") == pytest.approx(3.5)
+
+
+def test_stacked_roads_are_not_papered_over():
+    """Centres 0.2 m apart is a topology defect; narrowing would hide it."""
+    root = _two_parallel_roads(gap=0.2, width=3.5)
+
+    assert clip_false_lane_overlaps(root) == []
+    assert _width_of(root, "1") == pytest.approx(3.5)
+
+
+def test_clip_refuses_to_go_below_the_vissim_clamp():
+    """Vissim raises anything under 1 m back to 1 m, undoing the change."""
+    root = _two_parallel_roads(gap=0.9, width=3.5)
+
+    assert clip_false_lane_overlaps(root, min_centre_distance=0.5) == []
+    assert _width_of(root, "1") == pytest.approx(3.5)
+
+
+def test_opposing_lanes_are_not_clipped():
+    """The direction gate: an oncoming carriageway is not a neighbour lane."""
+    root = _two_parallel_roads(gap=2.9, width=3.5)
+    second = root.find("road[@id='2']")
+    geometry = second.find("planView/geometry")
+    geometry.set("hdg", str(math.pi))
+    geometry.set("x", "30.0")
+
+    assert clip_false_lane_overlaps(root) == []
+
+
+def test_roads_that_meet_at_a_joint_are_never_clipped():
+    """Consecutive roads approach by design; trimming them is always wrong.
+
+    Before this guard the Odaiba clip lost 1.57 m from road 15 lane 2 and
+    1.52 m from road 16 lane 1 — the two halves of one carriageway meeting at
+    their joint, read as an overlay because no sampled station happened to land
+    close enough to trip the distance test.
+    """
+    root = _two_parallel_roads(gap=2.9, width=3.5)
+    first = root.find("road[@id='1']")
+    link = ET.SubElement(first, "link")
+    ET.SubElement(
+        link, "successor", elementType="road", elementId="2", contactPoint="start"
+    )
+
+    assert clip_false_lane_overlaps(root) == []
+    assert _width_of(root, "1") == pytest.approx(3.5)
