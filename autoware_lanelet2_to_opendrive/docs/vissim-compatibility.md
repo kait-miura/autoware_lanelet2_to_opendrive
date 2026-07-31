@@ -149,31 +149,43 @@ Legend: ✅ satisfied ｜ ⚠ partial / needs verification ｜ ❌ not satisfied
   modeller to confirm it, so these warnings are inherent to the
   OpenDRIVE → Vissim path and must be reviewed in Vissim (UI or COM).
 
-  What *is* actionable is their **number**: 22 on the Odaiba clip, because
-  the converter models a multi-lane approach as one single-lane road (and
-  one single-lane connecting road) per lane, and those siblings run
-  parallel and overlap over their whole length. In junction 1000:
-
-  | incoming | connecting roads | length | run within 4 m for |
-  |---|---|---|---|
-  | 15 | 40, 41, 42 (→ roads 17, 18, 19) | 115–119 m | 107–122 m |
-  | 32 | 44, 45, 46 (→ roads 17, 18, 19) | 35 m | 36 m |
-  | 11 | 43, 47, 50 (→ road 29 lanes 1–3) | 41–46 m | 28–47 m |
-
-  Roads 17/18/19 are themselves three single-lane roads 3.3 m apart — one
-  per lane of the same carriageway. Vissim creates a conflict area for
-  every overlapping pair, and since both members belong to the same
-  traffic stream their priority is genuinely undeterminable. Connection
-  10 → 29 shows the shape that avoids this: **one** connecting road (49)
-  carrying three lanes with `laneLink` 1→1, 2→2, 3→3.
+  What *is* actionable is their **number**: 22 on the Odaiba clip. The
+  converter models a multi-lane approach as one single-lane road (and one
+  single-lane connecting road) per lane — roads 17/18/19 are three
+  single-lane roads 3.3 m apart, one per lane of the same carriageway —
+  and inside a large junction those siblings run parallel for their whole
+  length (connectors 40/41/42 are 115–119 m). Vissim creates a conflict
+  area for every overlapping pair, and because both members belong to the
+  same traffic stream their priority is genuinely undeterminable.
+  Connection 10 → 29 shows the shape that avoids this: **one** connecting
+  road (49) carrying three lanes with `laneLink` 1→1, 2→2, 3→3.
 
   Consolidating per-lane roads into multi-lane roads would collapse most
-  of these conflict areas, but it **cannot be done in this write-time
+  of these conflict areas, but it **cannot be done in the write-time
   profile**: road and lane ids are referenced by the `*.mapping.json`
   sidecar that `analyze`, the stop-line validation and the CARLA scenario
-  tooling consume, so renumbering or merging roads here would silently
+  tooling consume, so renumbering or merging roads there would silently
   invalidate them. It belongs in the conversion pipeline (multi-lane road
   emission), where the mapping is produced from the same model.
+
+  **Measuring overlap correctly.** Comparing *reference lines* is not
+  enough. On a two-way road split into per-direction roads, the two
+  reference lines can run within a metre of each other while the
+  carriageways sit side by side, because each road's lanes extend to its
+  own left. A reference-line metric reports that as a 100 % overlay — the
+  Odaiba connectors 40/41/42 look like they cover roads 20 and 22
+  completely, but their headings differ by 180° and the driveable surfaces
+  do not overlap at all. `vissim_topology.py` therefore samples **lane
+  centres** and only counts stations whose tangents agree within 45°.
+  Under that measure the only genuine overlay on the clip is connector 53
+  running along 48 % of road 12.
+
+  **Why it is reported, not repaired.** Dropping an overlapping connector
+  is unsafe at road level: connectors 43, 47 and 50 all run from road 11
+  to road 29 and look like mutual duplicates, yet each serves a
+  *different destination lane* (road 29 lanes 1, 2 and 3), so removing one
+  silently deletes a movement. The diagnostics list the constructs; the
+  repair belongs in the junction/divergence geometry generation.
 
 ### Minor / informational
 
@@ -210,6 +222,19 @@ is untouched. Settings (see `conf/target/vissim.yaml`):
 The pass logs a **Vissim import report**: counts of roads shorter than
 1.1 m / 0.5 m, lanes whose width falls below 1.0 m, and lanes whose
 width swing exceeds 0.25 m.
+
+Alongside it, `vissim_topology.analyze_topology` runs inside the pipeline
+(read-only) and reports the two constructs Vissim degrades on:
+
+- **connectors running along a through road** in the same direction, with
+  the covered fraction — Vissim puts an undetermined conflict area over
+  that stretch. Odaiba: `road 12: connector 53 (junction 1001) runs along
+  48% of it`.
+- **connectors below Vissim's 0.5 m minimum spline spacing**, with the
+  roads they join and whether the junction is structurally required.
+  Odaiba: six 0.01 m stubs (roads 34–39), all marked *junction needed*
+  because they express merges/diverges that a single predecessor and
+  successor cannot.
 
 ## Interaction with CARLA and Foretify targets
 

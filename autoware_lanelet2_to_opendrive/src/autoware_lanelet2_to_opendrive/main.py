@@ -2583,6 +2583,18 @@ class _Lanelet2ToOpenDRIVEConverter:
             final_roads.extend(parking_roads)
             print(f"Built {len(parking_roads)} parking roads")
 
+        # Step 6.95: Vissim topology diagnostics. Read-only — it reports the
+        # constructs Vissim degrades on (connectors running along a through
+        # road, connectors below its minimum spline spacing) so they can be
+        # reviewed in Vissim. Gated on the Vissim export profile.
+        if self.config.vissim.enabled:
+            from autoware_lanelet2_to_opendrive.vissim_topology import (
+                analyze_topology,
+            )
+
+            print("\n=== Vissim topology diagnostics ===")
+            analyze_topology(final_roads, junctions).log(logger)
+
         # Step 7: Write OpenDRIVE output
         opendrive = self._write_opendrive_output(
             final_roads, junctions, signals_and_controllers
