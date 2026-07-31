@@ -2152,6 +2152,29 @@ class _Lanelet2ToOpenDRIVEConverter:
                 opendrive, self.config.output_path, postprocess=postprocess
             )
             print(f"OpenDRIVE file saved to: {self.config.output_path}")
+            if self.config.vissim.enabled and self.config.vissim.signal_table_csv:
+                # Read back what was written, so the table describes the shipped
+                # file rather than the tree before the export profile ran.
+                import lxml.etree as _ET
+
+                from autoware_lanelet2_to_opendrive.vissim_profile import (
+                    write_vissim_signal_table,
+                )
+
+                signal_path = Path(self.config.output_path).with_suffix(
+                    ".vissim_signals.csv"
+                )
+                written = write_vissim_signal_table(
+                    signal_path,
+                    _ET.parse(str(self.config.output_path)).getroot(),
+                )
+                logger.info(
+                    "Vissim profile: wrote %d signal placement row(s) to %s — "
+                    "Vissim imports no signalization, so a Signal Head goes on "
+                    "the link and lane named there, at s from the link start",
+                    written,
+                    signal_path,
+                )
 
         return opendrive
 
@@ -3169,6 +3192,9 @@ def preprocess_and_convert_with_hydra(
         ),
         overlap_measurement_csv=(
             vissim_dict.get("overlap_measurement_csv", True) if vissim_dict else True
+        ),
+        signal_table_csv=(
+            vissim_dict.get("signal_table_csv", True) if vissim_dict else True
         ),
         vissim_mapping_csv=(
             vissim_dict.get("vissim_mapping_csv", True) if vissim_dict else True

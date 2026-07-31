@@ -152,6 +152,11 @@ class VissimConfig:
             lane change, and in Vissim a right turn then crosses three lanes at
             once. Overlapping geometry a modeller can resolve; a turn that has
             to cross three lanes cannot.
+        signal_table_csv: Write an ``<output>.vissim_signals.csv`` sidecar
+            listing every signal with the Vissim link and lane a Signal Head
+            belongs on, the distance from the link start, and the controllers
+            that group it. Vissim imports no signalization, so the heads are
+            placed by hand; this replaces the coordinate lookup per head.
         vissim_mapping_csv: Write an ``<output>.vissim_mapping.csv`` sidecar
             giving, per lanelet, the road and lane it became and the name Vissim
             will show for that road, with the projection offsets in the header.
@@ -211,6 +216,7 @@ class VissimConfig:
     align_connector_lanes: bool = True
     link_isolated_roads: bool = True
     vissim_mapping_csv: bool = True
+    signal_table_csv: bool = True
     clip_false_lane_overlaps: bool = False
     untag_straight_turn_lanelets: bool = True
     merge_parallel_lane_roads: bool = True
@@ -1119,3 +1125,127 @@ def evaluate_param_poly3(
     """Evaluate ``a + b·p + c·p² + d·p³`` (shared by tests)."""
     a, b, c, d = coefficients
     return a + b * p + c * p * p + d * p * p * p
+
+
+#: Columns of the Vissim signal placement CSV, in order.
+VISSIM_SIGNAL_CSV_COLUMNS = (
+    "signal_id",
+    "signal_name",
+    "signal_kind",
+    "opendrive_type",
+    "road_id",
+    "vissim_link_name",
+    "vissim_lane_index",
+    "s_along_road_m",
+    "t_offset_m",
+    "z_offset_m",
+    "orientation",
+    "controller_ids",
+)
+
+
+def _signal_lane_index(road: ET._Element, t: float) -> int:
+    """Which lane of the road the signal's ``t`` falls in, counted from inside.
+
+    Vissim places a Signal Head on a lane, not at a ``t``, so the offset has to
+    be resolved against the cumulative widths — the same walk that gives a lane
+    its centre.
+    """
+    section = road.find("lanes/laneSection")
+    if section is None:
+        return 0
+    side = "left" if t >= 0 else "right"
+    container = section.find(side)
+    if container is None:
+        return 0
+    sign = 1 if t >= 0 else -1
+    edge = 0.0
+    for index, lane in enumerate(
+        sorted(container.findall("lane"), key=lambda e: sign * int(e.get("id"))),
+        start=1,
+    ):
+        width = lane.find("width")
+        value = float(width.get("a")) if width is not None else 0.0
+        if abs(t) <= edge + value:
+            return index
+        edge += value
+    return 0
+
+
+def signal_table_rows(root: ET._Element) -> List[dict]:
+    """Every signal, with the Vissim link and lane a Signal Head belongs on.
+
+    Vissim imports no signalization at all (manual 2.6.9), so the ``<signal>``
+    records travel with the file for other consumers and a modeller has to place
+    Signal Heads by hand. What that costs is looking up a coordinate per head;
+    this table replaces the lookup, because the road id in the label is exactly
+    what Vissim reports back as the middle field of a link name.
+
+    ``controller_ids`` lists the ``<controller>`` elements whose control record
+    names the signal, which is the grouping a Vissim Signal Controller wants.
+    """
+    controllers: dict = {}
+    for controller in root.findall("controller"):
+        for control in controller.findall("control"):
+            controllers.setdefault(control.get("signalId"), []).append(
+                controller.get("id")
+            )
+    rows: List[dict] = []
+    for road in root.iter("road"):
+        lanes = road.find("lanes/laneSection")
+        side = "Left"
+        if lanes is not None and lanes.find("left") is None:
+            side = "Right"
+        connector = road.get("junction") not in ("-1", None)
+        for signal in road.iter("signal"):
+            t = float(signal.get("t") or 0.0)
+            name = signal.get("name") or ""
+            kind = (
+                "traffic_light"
+                if signal.get("dynamic") == "yes"
+                else "stop_line"
+                if "StopLine" in name
+                else "static"
+            )
+            rows.append(
+                {
+                    "signal_id": signal.get("id"),
+                    "signal_name": name,
+                    "signal_kind": kind,
+                    "opendrive_type": signal.get("type"),
+                    "road_id": road.get("id"),
+                    "vissim_link_name": (
+                        f"Road_{road.get('id')}-0-{side}"
+                        + (" Connector" if connector else "")
+                    ),
+                    "vissim_lane_index": _signal_lane_index(road, t),
+                    "s_along_road_m": round(float(signal.get("s") or 0.0), 3),
+                    "t_offset_m": round(t, 3),
+                    "z_offset_m": round(float(signal.get("zOffset") or 0.0), 3),
+                    "orientation": signal.get("orientation") or "",
+                    "controller_ids": " ".join(
+                        sorted(controllers.get(signal.get("id"), []))
+                    ),
+                }
+            )
+    rows.sort(key=lambda row: (row["signal_kind"], int(row["road_id"])))
+    return rows
+
+
+def write_vissim_signal_table(path, root: ET._Element) -> int:
+    """Write :func:`signal_table_rows` to ``path`` as CSV."""
+    import csv
+    from pathlib import Path
+
+    rows = signal_table_rows(root)
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        handle.write(
+            "# Vissim imports no signalization; place Signal Heads on the link "
+            "and lane below, at s_along_road_m from the link start.\n"
+        )
+        writer = csv.DictWriter(handle, fieldnames=list(VISSIM_SIGNAL_CSV_COLUMNS))
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)

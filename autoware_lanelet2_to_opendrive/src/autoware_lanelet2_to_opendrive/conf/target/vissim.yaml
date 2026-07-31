@@ -224,3 +224,12 @@ vissim:
   # without them the emitted local coordinates cannot be put back on the source
   # map's frame (x_absolute = x + offset_x).
   vissim_mapping_csv: true
+
+  # Write an "<output>.vissim_signals.csv" sidecar. Vissim imports no
+  # signalization at all (manual 2.6.9), so the <signal> and <controller>
+  # records travel with the file for other consumers while a modeller places
+  # Signal Heads by hand. This table says which Vissim link and lane each head
+  # belongs on, how far along the link, at what height, and which controllers
+  # group it — replacing a coordinate lookup per head. The Odaiba clip carries
+  # 14 traffic lights over 10 controllers and 12 stop lines.
+  signal_table_csv: true
