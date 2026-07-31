@@ -82,6 +82,14 @@ vissim:
   #   <number> — shift by that many metres
   elevation_baseline: "min"
 
+  # Merge roads that are the per-lane halves of one carriageway back into a
+  # single road. The divergence synthesis can emit each lane as its own road
+  # (Odaiba roads 23 and 24 run 3.27 m apart with a 0.03 deg heading
+  # difference and share both link ends), and in Vissim that shows up as the
+  # road visibly splitting. Only roads agreeing on BOTH link ends are merged,
+  # so the merged road inherits them unchanged and no movement has to move.
+  merge_parallel_lane_roads: true
+
   # Autoware tags a turn lane from where its POCKET OPENS, not from where the
   # turn begins, but the converter reads turn_direction as "this lanelet is
   # inside an intersection". A straight pocket therefore becomes a connecting

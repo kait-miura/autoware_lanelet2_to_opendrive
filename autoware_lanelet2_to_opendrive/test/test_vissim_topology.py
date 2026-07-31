@@ -864,3 +864,180 @@ def test_untag_tolerance_is_configurable():
     turn = _FakeLanelet(4, "left", _quarter_turn())
     assert untag_straight_turn_lanelets(_FakeMap([turn]), tolerance_deg=120.0)
     assert "turn_direction" not in turn.attributes
+
+
+# ---------------------------------------------------------------------------
+# merge_parallel_lane_roads
+# ---------------------------------------------------------------------------
+
+
+def _split_carriageway():
+    """One carriageway emitted as a 2-lane and a 1-lane road (Odaiba 23/24).
+
+    Road 24 is the inner one: road 23's reference line sits 3.26 m to its
+    left, exactly the width of road 24's single lane, so the carriageways
+    touch. Both share predecessor junction 1000 and successor road 26.
+    """
+    inner = _road(24, x=0.0, y=0.0, hdg=0.0, length=21.0, lane_widths=(3.26,))
+    outer = _road(23, x=0.0, y=3.26, hdg=0.0, length=20.9, lane_widths=(3.30, 3.31))
+    downstream = _road(
+        26, x=25.0, y=0.0, hdg=0.0, length=30.0, lane_widths=(3.3, 3.3, 3.3)
+    )
+    for road in (inner, outer):
+        road.link = RoadLink(
+            predecessor=Predecessor(ElementType.JUNCTION, 1000, None),
+            successor=Successor(ElementType.ROAD, 26, ContactPoint.START),
+        )
+    downstream.link = RoadLink(
+        predecessor=Predecessor(ElementType.ROAD, 24, ContactPoint.END)
+    )
+    inner.lanes.lane_sections[0].left_lanes[1].successor = LaneElementLink(id=1)
+    outer.lanes.lane_sections[0].left_lanes[1].successor = LaneElementLink(id=2)
+    outer.lanes.lane_sections[0].left_lanes[2].successor = LaneElementLink(id=3)
+    return [inner, outer, downstream]
+
+
+def test_per_lane_roads_merge_into_one_carriageway():
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        merge_parallel_lane_roads,
+    )
+
+    roads = _split_carriageway()
+    mapping = {1491: (24, 1), 1490: (23, 1), 1489: (23, 2)}
+
+    groups = merge_parallel_lane_roads(roads, [], lanelet_to_road_and_lane=mapping)
+
+    assert len(groups) == 1
+    assert groups[0].base_road_id == 24
+    assert groups[0].absorbed_road_ids == [23]
+    assert groups[0].lane_count == 3
+    # Road 23 is gone; road 24 carries all three lanes, ordered outward.
+    assert sorted(road.id for road in roads) == [24, 26]
+    merged = next(road for road in roads if road.id == 24)
+    lanes = merged.lanes.lane_sections[0].left_lanes
+    assert sorted(lanes) == [1, 2, 3]
+    assert [round(lanes[i].widths[0].a, 2) for i in (1, 2, 3)] == [3.26, 3.30, 3.31]
+    # The absorbed lanes keep the correspondence they already had.
+    assert [lanes[i].successor.id for i in (1, 2, 3)] == [1, 2, 3]
+    # The mapping now points at the merged road's lanes.
+    assert mapping == {1491: (24, 1), 1490: (24, 2), 1489: (24, 3)}
+
+
+def test_roads_with_different_links_are_not_merged():
+    """Differing link ends is what makes a merge unsafe, so it is refused."""
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        merge_parallel_lane_roads,
+    )
+
+    roads = _split_carriageway()
+    by_id = {road.id: road for road in roads}
+    by_id[23].link.successor = Successor(ElementType.ROAD, 99, ContactPoint.START)
+
+    assert merge_parallel_lane_roads(roads, []) == []
+    assert sorted(road.id for road in roads) == [23, 24, 26]
+
+
+def test_laterally_separated_roads_are_not_merged():
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        merge_parallel_lane_roads,
+    )
+
+    roads = _split_carriageway()
+    by_id = {road.id: road for road in roads}
+    # Push the outer road 12 m away: no longer one carriageway.
+    by_id[23].plan_view.geometries[0].y = 12.0
+
+    assert merge_parallel_lane_roads(roads, []) == []
+    assert sorted(road.id for road in roads) == [23, 24, 26]
+
+
+def test_junction_connections_are_retargeted_with_the_lane_shift():
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        merge_parallel_lane_roads,
+    )
+
+    roads = _split_carriageway()
+    # A connector feeding the outer road's lane 1 must end up on lane 2.
+    feeder = _connector(
+        63,
+        x=-5.0,
+        y=3.26,
+        hdg=0.0,
+        length=5.0,
+        junction=1000,
+        predecessor=99,
+        successor=23,
+    )
+    feeder.lanes.lane_sections[0].left_lanes[1].successor = LaneElementLink(id=1)
+    roads.append(feeder)
+
+    merge_parallel_lane_roads(roads, [])
+
+    assert feeder.link.successor.element_id == 24
+    assert feeder.lanes.lane_sections[0].left_lanes[1].successor.id == 2
+
+
+# ---------------------------------------------------------------------------
+# reciprocate_lane_links
+# ---------------------------------------------------------------------------
+
+
+def test_reciprocal_road_link_gets_the_lane_link_on_both_sides():
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        reciprocate_lane_links,
+    )
+
+    upstream = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0, lane_widths=(3.5, 3.5))
+    downstream = _road(2, x=30.0, y=0.0, hdg=0.0, length=30.0, lane_widths=(3.5, 3.5))
+    upstream.link = RoadLink(
+        successor=Successor(ElementType.ROAD, 2, ContactPoint.START)
+    )
+    downstream.link = RoadLink(
+        predecessor=Predecessor(ElementType.ROAD, 1, ContactPoint.END)
+    )
+    upstream.lanes.lane_sections[0].left_lanes[1].successor = LaneElementLink(id=1)
+    upstream.lanes.lane_sections[0].left_lanes[2].successor = LaneElementLink(id=2)
+
+    assert reciprocate_lane_links([upstream, downstream]) == 2
+    far = downstream.lanes.lane_sections[0].left_lanes
+    assert [far[i].predecessor.id for i in (1, 2)] == [1, 2]
+
+
+def test_reciprocation_never_overwrites_an_existing_link():
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        reciprocate_lane_links,
+    )
+
+    upstream = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    downstream = _road(2, x=30.0, y=0.0, hdg=0.0, length=30.0)
+    upstream.link = RoadLink(
+        successor=Successor(ElementType.ROAD, 2, ContactPoint.START)
+    )
+    downstream.link = RoadLink(
+        predecessor=Predecessor(ElementType.ROAD, 1, ContactPoint.END)
+    )
+    upstream.lanes.lane_sections[0].left_lanes[1].successor = LaneElementLink(id=1)
+    downstream.lanes.lane_sections[0].left_lanes[1].predecessor = LaneElementLink(id=7)
+
+    assert reciprocate_lane_links([upstream, downstream]) == 0
+    assert downstream.lanes.lane_sections[0].left_lanes[1].predecessor.id == 7
+
+
+def test_one_sided_road_link_is_left_alone():
+    """Without a reciprocal road link the lane id would be unresolvable."""
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        reciprocate_lane_links,
+    )
+
+    upstream = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    downstream = _road(2, x=30.0, y=0.0, hdg=0.0, length=30.0)
+    upstream.link = RoadLink(
+        successor=Successor(ElementType.ROAD, 2, ContactPoint.START)
+    )
+    downstream.link = RoadLink(
+        predecessor=Predecessor(ElementType.ROAD, 9, ContactPoint.END)
+    )
+    upstream.lanes.lane_sections[0].left_lanes[1].successor = LaneElementLink(id=1)
+
+    assert reciprocate_lane_links([upstream, downstream]) == 0
+    assert downstream.lanes.lane_sections[0].left_lanes[1].predecessor is None

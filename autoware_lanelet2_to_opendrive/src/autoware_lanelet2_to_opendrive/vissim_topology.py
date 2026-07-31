@@ -41,6 +41,7 @@ artifact is why a naive metric flags connectors which merely pass the other
 side of the road.
 """
 
+import itertools
 import logging
 import math
 from collections import defaultdict
@@ -566,6 +567,327 @@ def _rewire_lane_links(
     for lane in _driving_lanes(neighbour):
         target = mapping.get(int(lane.lane_id))
         setattr(lane, side, LaneLink(id=target) if target is not None else None)
+
+
+@dataclass
+class MergedRoadGroup:
+    """Per-lane roads of one carriageway that were merged into one road."""
+
+    base_road_id: int
+    absorbed_road_ids: List[int]
+    lane_count: int
+
+
+def _lateral_offset(base: Road, other: Road, fractions=(0.0, 0.25, 0.5, 0.75, 1.0)):
+    """Mean signed lateral offset of ``other``'s reference line from ``base``.
+
+    Returns ``None`` when the two are not parallel over their length.
+    """
+    base_stations = _band_stations(base, len(fractions))
+    other_stations = _band_stations(other, len(fractions))
+    if len(base_stations) != len(other_stations) or not base_stations:
+        return None
+    offsets = []
+    for (base_points, base_heading), (other_points, other_heading) in zip(
+        base_stations, other_stations
+    ):
+        delta = abs((other_heading - base_heading + math.pi) % (2 * math.pi) - math.pi)
+        if delta > math.radians(10.0):
+            return None
+        # Reference-line points are the first entry only when a lane sits at
+        # t = 0, so recover them from the lane centre and its own offset.
+        normal = (-math.sin(base_heading), math.cos(base_heading))
+        offsets.append(
+            (other_points[0][0] - base_points[0][0]) * normal[0]
+            + (other_points[0][1] - base_points[0][1]) * normal[1]
+        )
+    return sum(offsets) / len(offsets)
+
+
+def _reference_offset(base: Road, other: Road):
+    """Lateral offset between the two roads' *reference lines*."""
+    base_offsets = _lane_centre_offsets(base)
+    other_offsets = _lane_centre_offsets(other)
+    if not base_offsets or not other_offsets:
+        return None
+    lane_offset = _lateral_offset(base, other)
+    if lane_offset is None:
+        return None
+    # _lateral_offset compared the first lane centre of each road; convert to
+    # reference lines by removing each road's own first-lane offset.
+    return lane_offset - other_offsets[0] + base_offsets[0]
+
+
+def _carriageway_width(road: Road) -> float:
+    """Total width of the road's driving lanes in the first section."""
+    total = 0.0
+    for lane in _driving_lanes(road):
+        widths = getattr(lane, "widths", None) or []
+        if widths:
+            total += float(getattr(widths[0], "a", 0.0) or 0.0)
+    return total
+
+
+def _link_target(road: Road, side: str):
+    end = getattr(road.link, side, None) if road.link is not None else None
+    if end is None:
+        return None
+    return (end.element_type, int(end.element_id))
+
+
+def merge_parallel_lane_roads(
+    roads: List[Road],
+    junctions: Sequence[Junction],
+    *,
+    lanelet_to_road_and_lane: Optional[Dict[int, Tuple[int, int]]] = None,
+    lanelet_to_emitted_segments: Optional[Dict[int, List[dict]]] = None,
+    length_tolerance: float = 0.2,
+    adjacency_tolerance: float = 1.0,
+) -> List[MergedRoadGroup]:
+    """Merge per-lane roads of one carriageway back into a single road.
+
+    The divergence synthesis can emit each lane of a carriageway as its own
+    road: on the Odaiba clip roads 23 and 24 run 3.27 m apart with a 0.03°
+    heading difference, share the same predecessor *and* successor, and are
+    really the two- and one-lane halves of one three-lane carriageway. In
+    Vissim they arrive as separate links, so the road visibly splits.
+
+    Merging is restricted to roads that agree on **both** link ends, which is
+    what makes it safe: the merged road inherits those links unchanged, so no
+    movement has to be re-expressed. Candidates must also be parallel, of
+    similar length, and laterally adjacent (the gap between the carriageways
+    is within ``adjacency_tolerance``).
+
+    The innermost member keeps its id, geometry and elevation — its reference
+    line already lies at the inner edge of the merged carriageway — and the
+    others contribute their lanes, renumbered outward. References from
+    junction connections and neighbouring roads are retargeted with the
+    matching lane shift, and the lanelet mapping is rewritten so the sidecar
+    keeps pointing at the right lane.
+
+    Returns one :class:`MergedRoadGroup` per merge.
+    """
+    by_id = {road.id: road for road in roads}
+
+    # ---- candidate pairs -------------------------------------------------
+    parent = {road.id: road.id for road in roads}
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for first, second in itertools.combinations(sorted(by_id), 2):
+        left, right = by_id[first], by_id[second]
+        if left.junction != right.junction:
+            continue
+        if _link_target(left, "predecessor") != _link_target(right, "predecessor"):
+            continue
+        if _link_target(left, "successor") != _link_target(right, "successor"):
+            continue
+        if _link_target(left, "predecessor") is None and (
+            _link_target(left, "successor") is None
+        ):
+            continue
+        longest = max(left.length, right.length)
+        if longest <= 0.0 or abs(left.length - right.length) / longest > (
+            length_tolerance
+        ):
+            continue
+        offset = _reference_offset(left, right)
+        if offset is None:
+            continue
+        # The road on the negative side spans [offset, offset + its width]; the
+        # carriageways touch when that meets the other's reference line.
+        expected = _carriageway_width(right) if offset < 0 else _carriageway_width(left)
+        if abs(abs(offset) - expected) > adjacency_tolerance:
+            continue
+        a, b = find(first), find(second)
+        if a != b:
+            parent[b] = a
+
+    groups: Dict[int, List[int]] = {}
+    for road_id in sorted(by_id):
+        groups.setdefault(find(road_id), []).append(road_id)
+
+    merged: List[MergedRoadGroup] = []
+    removed: Set[int] = set()
+    # (old_road_id, old_lane_id) -> (new_road_id, new_lane_id)
+    remap: Dict[Tuple[int, int], Tuple[int, int]] = {}
+
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        anchor = by_id[members[0]]
+        ordered = []
+        for road_id in members:
+            offset = (
+                0.0
+                if road_id == anchor.id
+                else _reference_offset(anchor, by_id[road_id])
+            )
+            if offset is None:
+                ordered = []
+                break
+            ordered.append((offset, road_id))
+        if len(ordered) != len(members):
+            continue
+        # Lanes run outward from the reference line, so the base is the member
+        # the others sit *outside* of: the innermost one on the lane side.
+        lanes_on_left = any(lane.lane_id > 0 for lane in _driving_lanes(anchor))
+        ordered.sort(key=lambda item: item[0], reverse=not lanes_on_left)
+        base = by_id[ordered[0][1]]
+        base_section = base.lanes.lane_sections[0]
+        sign = 1 if lanes_on_left else -1
+        next_index = len(_driving_lanes(base))
+
+        for _, road_id in ordered[1:]:
+            member = by_id[road_id]
+            member_lanes = sorted(
+                _driving_lanes(member), key=lambda lane: abs(lane.lane_id)
+            )
+            for lane in member_lanes:
+                next_index += 1
+                old = (road_id, lane.lane_id)
+                lane.lane_id = sign * next_index
+                if lanes_on_left:
+                    base_section.left_lanes[lane.lane_id] = lane
+                else:
+                    base_section.right_lanes[lane.lane_id] = lane
+                remap[old] = (base.id, lane.lane_id)
+            removed.add(road_id)
+
+        merged.append(
+            MergedRoadGroup(
+                base_road_id=base.id,
+                absorbed_road_ids=sorted(r for _, r in ordered[1:]),
+                lane_count=next_index,
+            )
+        )
+
+    if not merged:
+        return merged
+
+    # ---- retarget every reference to an absorbed road ---------------------
+    def shifted_lane(old_road: int, old_lane: int) -> Optional[int]:
+        target = remap.get((old_road, old_lane))
+        return target[1] if target else None
+
+    for road in roads:
+        if road.link is None:
+            continue
+        for side, lane_side in (
+            ("predecessor", "predecessor"),
+            ("successor", "successor"),
+        ):
+            end = getattr(road.link, side)
+            if (
+                end is None
+                or end.element_type != ElementType.ROAD
+                or int(end.element_id) not in removed
+            ):
+                continue
+            old_road = int(end.element_id)
+            new_road = remap_road_of(old_road, remap)
+            if new_road is None:
+                continue
+            end.element_id = new_road
+            for lane in _driving_lanes(road):
+                link = getattr(lane, lane_side, None)
+                if link is None:
+                    continue
+                new_lane = shifted_lane(old_road, int(link.id))
+                if new_lane is not None:
+                    link.id = new_lane
+
+    for junction in junctions:
+        for connection in junction.connections:
+            if int(connection.incoming_road) in removed:
+                new_road = remap_road_of(int(connection.incoming_road), remap)
+                if new_road is not None:
+                    for lane_link in connection.lane_links:
+                        new_lane = shifted_lane(
+                            int(connection.incoming_road), int(lane_link.from_lane)
+                        )
+                        if new_lane is not None:
+                            lane_link.from_lane = new_lane
+                    connection.incoming_road = new_road
+
+    roads[:] = [road for road in roads if road.id not in removed]
+
+    # ---- keep the mapping sidecar pointing at the right lane -------------
+    if lanelet_to_road_and_lane is not None:
+        for lanelet_id, (road_id, lane_id) in list(lanelet_to_road_and_lane.items()):
+            target = remap.get((road_id, lane_id))
+            if target is not None:
+                lanelet_to_road_and_lane[lanelet_id] = target
+    if lanelet_to_emitted_segments is not None:
+        for segments in lanelet_to_emitted_segments.values():
+            for segment in segments:
+                target = remap.get((segment.get("road_id"), segment.get("lane_id")))
+                if target is not None:
+                    segment["road_id"], segment["lane_id"] = target
+
+    return merged
+
+
+def reciprocate_lane_links(roads: Sequence[Road]) -> int:
+    """Fill in the lane link the other side of a reciprocal road link asserts.
+
+    Where two roads name each other at road level there is no ambiguity left,
+    so a lane correspondence stated by one of them can be stated by both. The
+    dissolve and merge passes leave such half-stated links behind — OpenDRIVE
+    forced the one-sidedness while several branches still competed for the
+    same endpoint, and after merging only one remains.
+
+    Returns the number of lane links added.
+    """
+    by_id = {road.id: road for road in roads}
+    added = 0
+    for road in roads:
+        if road.link is None or road.link.successor is None:
+            continue
+        end = road.link.successor
+        if end.element_type != ElementType.ROAD:
+            continue
+        other = by_id.get(int(end.element_id))
+        if other is None or other.link is None:
+            continue
+        back = (
+            other.link.predecessor
+            if end.contact_point == ContactPoint.START
+            else other.link.successor
+        )
+        if (
+            back is None
+            or back.element_type != ElementType.ROAD
+            or int(back.element_id) != road.id
+        ):
+            continue
+        far_side = (
+            "predecessor" if end.contact_point == ContactPoint.START else "successor"
+        )
+        for lane in _driving_lanes(road):
+            link = getattr(lane, "successor", None)
+            if link is None:
+                continue
+            target = _lane_by_id(other, int(link.id))
+            if target is None or getattr(target, far_side, None) is not None:
+                continue
+            setattr(target, far_side, LaneLink(id=lane.lane_id))
+            added += 1
+    return added
+
+
+def remap_road_of(
+    old_road: int, remap: Dict[Tuple[int, int], Tuple[int, int]]
+) -> Optional[int]:
+    """The road an absorbed road's lanes moved into."""
+    for (road_id, _), (new_road, _) in remap.items():
+        if road_id == old_road:
+            return new_road
+    return None
 
 
 def _lane_by_id(road: Road, lane_id: int):

@@ -109,6 +109,9 @@ class VissimConfig:
             road surface at zero, ``"mean"`` centres the network, ``"none"``
             keeps absolute elevation, and a float shifts by that many metres.
             Only a constant offset is applied, so every gradient is preserved.
+        merge_parallel_lane_roads: Merge roads that are per-lane halves of one
+            carriageway back into a single road. Only roads agreeing on both
+            link ends are merged, so the merged road inherits them unchanged.
         untag_straight_turn_lanelets: Drop ``turn_direction`` from lanelets
             that carry ``left``/``right`` while running straight. Autoware
             tags a turn lane from where its pocket opens, but the converter
@@ -141,6 +144,7 @@ class VissimConfig:
     elevation_baseline: Union[str, float] = "min"
     absorb_degenerate_stubs: bool = True
     untag_straight_turn_lanelets: bool = True
+    merge_parallel_lane_roads: bool = True
 
     def __post_init__(self) -> None:
         if self.param_poly3_p_range not in _P_RANGE_MODES:

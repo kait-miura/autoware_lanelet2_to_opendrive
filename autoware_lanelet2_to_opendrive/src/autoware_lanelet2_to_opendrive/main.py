@@ -2594,6 +2594,8 @@ class _Lanelet2ToOpenDRIVEConverter:
                 align_connector_elevations,
                 analyze_topology,
                 dissolve_non_intersection_junctions,
+                merge_parallel_lane_roads,
+                reciprocate_lane_links,
             )
 
             print("\n=== Vissim topology pass ===")
@@ -2639,6 +2641,30 @@ class _Lanelet2ToOpenDRIVEConverter:
                             for s, a, b, both in stubs
                         ),
                     )
+            if self.config.vissim.merge_parallel_lane_roads:
+                groups = merge_parallel_lane_roads(
+                    final_roads,
+                    junctions,
+                    lanelet_to_road_and_lane=lanelet_to_road_and_lane,
+                    lanelet_to_emitted_segments=mapping.lanelet_to_emitted_segments,
+                )
+                for group in groups:
+                    logger.info(
+                        "Vissim topology: merged per-lane roads %s into road %d "
+                        "(%d lanes) — they are one carriageway split per lane, "
+                        "with identical predecessor and successor",
+                        group.absorbed_road_ids,
+                        group.base_road_id,
+                        group.lane_count,
+                    )
+            filled = reciprocate_lane_links(final_roads)
+            if filled:
+                logger.info(
+                    "Vissim topology: stated %d lane link(s) on both sides of a "
+                    "reciprocal road link (the one-sidedness OpenDRIVE forced "
+                    "while several branches competed for one endpoint)",
+                    filled,
+                )
             analyze_topology(final_roads, junctions).log(logger)
 
         # Step 7: Write OpenDRIVE output
@@ -2998,6 +3024,9 @@ def preprocess_and_convert_with_hydra(
             vissim_dict.get("untag_straight_turn_lanelets", True)
             if vissim_dict
             else True
+        ),
+        merge_parallel_lane_roads=(
+            vissim_dict.get("merge_parallel_lane_roads", True) if vissim_dict else True
         ),
     )
     if vissim_config.enabled and vissim_config.local_geo_reference:
