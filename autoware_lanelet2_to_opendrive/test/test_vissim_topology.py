@@ -22,6 +22,9 @@ from autoware_lanelet2_to_opendrive.opendrive.junction import (
     LaneLink,
 )
 from autoware_lanelet2_to_opendrive.opendrive.lane import Lane
+from autoware_lanelet2_to_opendrive.opendrive.lane_elements import (
+    LaneLink as LaneElementLink,
+)
 from autoware_lanelet2_to_opendrive.opendrive.lane_elements import LaneWidth
 from autoware_lanelet2_to_opendrive.opendrive.lane_section import LaneSection
 from autoware_lanelet2_to_opendrive.opendrive.lane_sections import Lanes
@@ -554,3 +557,62 @@ def test_dissolve_leaves_road_and_lane_ids_untouched():
         for road in roads
     ]
     assert before == after
+
+
+def test_dissolve_rewires_lane_links_against_the_primary_branch():
+    """Lane ids were relative to the junction; they must be re-expressed.
+
+    Leaving the junction-era ids in place is what makes a consumer lose the
+    lane correspondence and connect every lane to every lane.
+    """
+    roads, junctions = _diverge_network()
+    by_id = {road.id: road for road in roads}
+    # As emitted with the junction in place: the approach's lane links carry
+    # bare ids that only resolve through <connection><laneLink>.
+    for lane_id, target in ((1, 1), (2, 2), (3, 3)):
+        by_id[1].lanes.lane_sections[0].left_lanes[lane_id].successor = LaneElementLink(
+            id=target
+        )
+    for lane_id in (1, 2, 3):
+        by_id[5].lanes.lane_sections[0].left_lanes[
+            lane_id
+        ].predecessor = LaneElementLink(id=lane_id)
+        by_id[5].lanes.lane_sections[0].left_lanes[lane_id].successor = LaneElementLink(
+            id=lane_id
+        )
+        by_id[3].lanes.lane_sections[0].left_lanes[
+            lane_id
+        ].predecessor = LaneElementLink(id=lane_id)
+    by_id[6].lanes.lane_sections[0].left_lanes[1].successor = LaneElementLink(id=1)
+    by_id[4].lanes.lane_sections[0].left_lanes[1].predecessor = LaneElementLink(id=1)
+
+    dissolve_non_intersection_junctions(roads, junctions)
+
+    approach_lanes = by_id[1].lanes.lane_sections[0].left_lanes
+    # Every approach lane now names the primary connector's matching lane.
+    assert [approach_lanes[i].successor.id for i in (1, 2, 3)] == [1, 2, 3]
+    # The through road resolves back through the primary connector.
+    through_lanes = by_id[3].lanes.lane_sections[0].left_lanes
+    assert [through_lanes[i].predecessor.id for i in (1, 2, 3)] == [1, 2, 3]
+    # The side road is fed by the turn connector, which keeps its own links.
+    assert by_id[4].lanes.lane_sections[0].left_lanes[1].predecessor.id == 1
+
+
+def test_lane_without_a_correspondence_is_cleared_not_left_dangling():
+    """An added lane fed only by a secondary branch must have no link.
+
+    A stale id would resolve against the primary connector and duplicate a
+    correspondence; clearing it leaves the lane as what it is — a lane that
+    starts here and is reached by changing lanes.
+    """
+    roads, junctions = _diverge_network()
+    by_id = {road.id: road for road in roads}
+    # Road 3 gains a fourth lane fed by the secondary branch only.
+    extra = Lane(lane_id=4, lane_type=LaneType.DRIVING)
+    extra.widths = [LaneWidth(s_offset=0.0, a=3.5)]
+    extra.predecessor = LaneElementLink(id=1)
+    by_id[3].lanes.lane_sections[0].left_lanes[4] = extra
+
+    dissolve_non_intersection_junctions(roads, junctions)
+
+    assert by_id[3].lanes.lane_sections[0].left_lanes[4].predecessor is None

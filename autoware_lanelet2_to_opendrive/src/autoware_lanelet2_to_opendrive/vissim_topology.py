@@ -48,8 +48,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .opendrive.enums import ContactPoint, ElementType
-from .opendrive.junction import Junction
+from .opendrive.junction import Connection, Junction
 from .opendrive.road import Road
+from .opendrive.lane_elements import LaneLink
 from .opendrive.road_links import Predecessor, Successor
 
 logger = logging.getLogger(__name__)
@@ -372,6 +373,56 @@ def _endpoints(road: Road) -> Tuple[Optional[int], Optional[int]]:
     return (road_id(road.link.predecessor), road_id(road.link.successor))
 
 
+def _driving_lanes(road: Road) -> List:
+    """Lanes of the road's first section, center lane excluded."""
+    if road.lanes is None or not road.lanes.lane_sections:
+        return []
+    section = road.lanes.lane_sections[0]
+    lanes = list(getattr(section, "left_lanes", {}).values())
+    lanes += list(getattr(section, "right_lanes", {}).values())
+    return lanes
+
+
+def _rewire_lane_links(
+    neighbour: Road,
+    side: str,
+    connector: Road,
+    connection: Optional[Connection],
+) -> None:
+    """Re-express a neighbour's lane links against a now-direct connector.
+
+    While the junction existed, lane correspondence was carried by
+    ``<connection><laneLink from to>``; the bare ids in the neighbour's
+    ``<lane><link>`` were only meaningful through that indirection. Once the
+    road-level link points straight at one connecting road, those ids resolve
+    against the wrong road — which is what makes a consumer fall back to
+    connecting every lane to every lane (the tell-tale lattice of connectors
+    over a plain road stretch).
+
+    The junction's lane links are the authority for the incoming side, and
+    the connector's own lane links for the outgoing side. A lane with no
+    correspondence has its link cleared rather than left dangling.
+    """
+    if side == "successor":
+        # neighbour lane -> connector lane, straight from the junction record.
+        mapping = {
+            int(link.from_lane): int(link.to_lane)
+            for link in (connection.lane_links if connection is not None else [])
+        }
+    else:
+        # connector lane -> neighbour lane, inverted from the connector's own
+        # lane links.
+        mapping = {}
+        for lane in _driving_lanes(connector):
+            end = getattr(lane, "successor", None)
+            if end is not None:
+                mapping[int(end.id)] = int(lane.lane_id)
+
+    for lane in _driving_lanes(neighbour):
+        target = mapping.get(int(lane.lane_id))
+        setattr(lane, side, LaneLink(id=target) if target is not None else None)
+
+
 def _is_intersection(
     junction: Junction,
     by_id: Dict[int, Road],
@@ -460,6 +511,10 @@ def dissolve_non_intersection_junctions(
             int(connection.connecting_road): len(connection.lane_links)
             for connection in junction.connections
         }
+        connection_of_connector = {
+            int(connection.connecting_road): connection
+            for connection in junction.connections
+        }
 
         for connecting_id in connecting_ids:
             connector = by_id.get(connecting_id)
@@ -496,6 +551,8 @@ def dissolve_non_intersection_junctions(
                         candidates.append(connecting_id)
                 if not candidates:
                     setattr(road.link, side, None)
+                    for lane in _driving_lanes(road):
+                        setattr(lane, side, None)
                     continue
                 primary = max(candidates, key=lambda rid: (weight.get(rid, 0), -rid))
                 contact = (
@@ -507,6 +564,14 @@ def dissolve_non_intersection_junctions(
                     )
                 else:
                     road.link.successor = Successor(ElementType.ROAD, primary, contact)
+                # The bare lane ids were relative to the junction; re-express
+                # them against the connecting road the link now names.
+                _rewire_lane_links(
+                    road,
+                    side,
+                    by_id[primary],
+                    connection_of_connector.get(primary),
+                )
 
         report.dissolved_junctions.append(
             DissolvedJunction(
