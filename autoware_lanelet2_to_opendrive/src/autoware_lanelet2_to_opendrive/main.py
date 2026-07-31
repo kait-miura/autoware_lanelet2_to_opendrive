@@ -2594,6 +2594,7 @@ class _Lanelet2ToOpenDRIVEConverter:
                 align_connector_elevations,
                 analyze_topology,
                 dissolve_non_intersection_junctions,
+                merge_consecutive_roads,
                 merge_parallel_lane_roads,
                 reciprocate_lane_links,
             )
@@ -2628,13 +2629,18 @@ class _Lanelet2ToOpenDRIVEConverter:
                     for road_id in dissolved.connecting_roads
                 )
             if self.config.vissim.absorb_degenerate_stubs:
-                stubs = absorb_degenerate_stubs(final_roads, junctions)
+                stubs = absorb_degenerate_stubs(
+                    final_roads,
+                    junctions,
+                    min_length=self.config.vissim.absorb_stub_max_length,
+                )
                 if stubs:
                     logger.info(
                         "Vissim topology: absorbed %d stub road(s) below "
-                        "Vissim's %.1f m minimum into direct links: %s",
+                        "Vissim's %.1f m fragment threshold into direct "
+                        "links: %s",
                         len(stubs),
-                        0.5,
+                        self.config.vissim.absorb_stub_max_length,
                         ", ".join(
                             f"road {s} ({a} -> {b}"
                             f"{', one-sided' if not both else ''})"
@@ -2656,6 +2662,21 @@ class _Lanelet2ToOpenDRIVEConverter:
                         group.absorbed_road_ids,
                         group.base_road_id,
                         group.lane_count,
+                    )
+            if self.config.vissim.merge_consecutive_roads:
+                chains = merge_consecutive_roads(
+                    final_roads,
+                    junctions,
+                    lanelet_to_road_and_lane=lanelet_to_road_and_lane,
+                )
+                for chain in chains:
+                    logger.info(
+                        "Vissim topology: joined roads %s onto road %d end to "
+                        "end (%.1f m) — one carriageway cut into pieces, each "
+                        "of which would be its own link",
+                        chain.absorbed_road_ids,
+                        chain.base_road_id,
+                        chain.total_length,
                     )
             filled = reciprocate_lane_links(final_roads)
             if filled:
@@ -3020,6 +3041,9 @@ def preprocess_and_convert_with_hydra(
         absorb_degenerate_stubs=(
             vissim_dict.get("absorb_degenerate_stubs", True) if vissim_dict else True
         ),
+        absorb_stub_max_length=(
+            vissim_dict.get("absorb_stub_max_length", 3.0) if vissim_dict else 3.0
+        ),
         untag_straight_turn_lanelets=(
             vissim_dict.get("untag_straight_turn_lanelets", True)
             if vissim_dict
@@ -3027,6 +3051,9 @@ def preprocess_and_convert_with_hydra(
         ),
         merge_parallel_lane_roads=(
             vissim_dict.get("merge_parallel_lane_roads", True) if vissim_dict else True
+        ),
+        merge_consecutive_roads=(
+            vissim_dict.get("merge_consecutive_roads", True) if vissim_dict else True
         ),
     )
     if vissim_config.enabled and vissim_config.local_geo_reference:

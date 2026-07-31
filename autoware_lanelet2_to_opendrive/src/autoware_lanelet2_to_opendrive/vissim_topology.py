@@ -73,6 +73,13 @@ DEFAULT_STRAIGHT_TURN_TOLERANCE_DEG = 25.0
 #: connecting road cannot be represented as a proper connector.
 VISSIM_MIN_CONNECTOR_LENGTH = 0.5
 
+#: A road this short is a fragment rather than a link. Dissolving a junction
+#: turns its connecting roads into ordinary roads, and a connector that was
+#: naturally a metre or two long then arrives as a link that short — which is
+#: what a fragmented network looks like. Absorbing it hands the stretch back
+#: to a connector, which is where a couple of metres belongs.
+DEFAULT_ABSORB_MAX_LENGTH = 3.0
+
 #: Two carriageways only belong to the same traffic stream when their
 #: tangents agree within this angle. Without the gate, the opposing
 #: carriageway of a two-way road — whose reference line can run within a
@@ -1032,6 +1039,247 @@ def remap_road_of(
     return None
 
 
+@dataclass
+class MergedChain:
+    """Consecutive roads joined end to end into a single road."""
+
+    base_road_id: int
+    absorbed_road_ids: List[int]
+    total_length: float
+
+
+def _lane_successor_is_identity(road: Road) -> bool:
+    """Does every lane continue as the lane with the same id?"""
+    lanes = _driving_lanes(road)
+    if not lanes:
+        return False
+    for lane in lanes:
+        end = getattr(lane, "successor", None)
+        if end is None or int(end.id) != lane.lane_id:
+            return False
+    return True
+
+
+def _references_to_endpoint(
+    road_id: int,
+    contact: ContactPoint,
+    roads: Sequence[Road],
+    junctions,
+) -> int:
+    """How many roads attach to one specific end of ``road_id``.
+
+    A joint may only be merged when exactly one road sits on the far side of
+    it. Counting every mention of the road would always find at least two —
+    the neighbour on each side — so the contact point decides which end a
+    mention is about.
+    """
+    count = 0
+    for road in roads:
+        if road.id == road_id or road.link is None:
+            continue
+        for side in ("predecessor", "successor"):
+            end = getattr(road.link, side)
+            if (
+                end is not None
+                and end.element_type == ElementType.ROAD
+                and int(end.element_id) == road_id
+                and end.contact_point == contact
+            ):
+                count += 1
+    # A junction reaches an incoming road through whichever end faces it, so
+    # any mention counts against both.
+    for junction in junctions:
+        for connection in junction.connections:
+            if int(connection.incoming_road) == road_id:
+                count += 1
+    return count
+
+
+def merge_consecutive_roads(
+    roads: List[Road],
+    junctions: Sequence[Junction],
+    *,
+    lanelet_to_road_and_lane: Optional[Dict[int, Tuple[int, int]]] = None,
+) -> List[MergedChain]:
+    """Join consecutive roads end to end so links stop arriving in pieces.
+
+    A carriageway is emitted as one road per source lanelet group, so a
+    straight run of unchanging cross-section can still be several roads. Each
+    becomes its own Vissim link joined by a connector, which is what a
+    fragmented network looks like on import: on the Odaiba clip roads 8, 9,
+    10 and 0 are one continuous single-lane road cut into four (27.7 + 30.0 +
+    52.7 + 16.0 m), and roads 42 and 75 are 0.91 m and 1.81 m offcuts.
+
+    Only an unambiguous joint is merged: the two roads must name each other
+    at road level, both be outside a junction, carry the same number of
+    lanes with a complete lane correspondence, and neither end may be
+    referenced by a third road or junction — otherwise the joint is a merge
+    or diverge point and the roads have to stay apart.
+
+    The absorbed road must also carry **no source lanelet**. The mapping
+    sidecar keys a lanelet by ``(road, lane)`` and its reverse index is 1:1,
+    so folding two lanelet-backed roads together would put two lanelets on
+    one road lane and the mapping cross-validation rightly rejects that. The
+    fragments that matter are synthetic anyway: on the Odaiba clip roads 42
+    and 75 are 0.91 m and 1.81 m offcuts with no lanelet behind them, while
+    the lanelet-backed roads are 16–52 m, which is an ordinary Vissim link
+    length.
+
+    Geometry, elevation and every ``sOffset``-bearing lane record of the
+    absorbed road are appended with its station shifted by the base road's
+    length, as are its objects and signals, so the merged road is the exact
+    concatenation.
+    """
+    by_id = {road.id: road for road in roads}
+    lanelet_backed = {
+        road_id for road_id, _ in (lanelet_to_road_and_lane or {}).values()
+    }
+
+    def lane_correspondence(first: Road) -> Optional[Dict[int, int]]:
+        """``{lane id on first: lane id on its successor}``, or None if partial."""
+        mapping: Dict[int, int] = {}
+        for lane in _driving_lanes(first):
+            end = getattr(lane, "successor", None)
+            if end is None:
+                return None
+            mapping[lane.lane_id] = int(end.id)
+        return mapping or None
+
+    def joins(first: Road, second: Road) -> bool:
+        if first.junction != -1 or second.junction != -1:
+            return False
+        forward = _link_target(first, "successor")
+        back = _link_target(second, "predecessor")
+        if forward != (ElementType.ROAD, second.id):
+            return False
+        if back != (ElementType.ROAD, first.id):
+            return False
+        if first.link.successor.contact_point != ContactPoint.START:
+            return False
+        if second.link.predecessor.contact_point != ContactPoint.END:
+            return False
+        if second.id in lanelet_backed:
+            return False
+        mapping = lane_correspondence(first)
+        if mapping is None:
+            return False
+        second_ids = {lane.lane_id for lane in _driving_lanes(second)}
+        if set(mapping.values()) != second_ids:
+            return False
+        # A third party at the joint means it is a merge or a diverge.
+        if _references_to_endpoint(second.id, ContactPoint.START, roads, junctions) > 1:
+            return False
+        if _references_to_endpoint(first.id, ContactPoint.END, roads, junctions) > 1:
+            return False
+        return True
+
+    successor_of: Dict[int, int] = {}
+    for first in roads:
+        target = _link_target(first, "successor")
+        if target is None or target[0] != ElementType.ROAD:
+            continue
+        second = by_id.get(target[1])
+        if second is not None and joins(first, second):
+            successor_of[first.id] = second.id
+
+    heads = [rid for rid in successor_of if rid not in set(successor_of.values())]
+    merged: List[MergedChain] = []
+    removed: Set[int] = set()
+
+    for head in sorted(heads):
+        chain = [head]
+        while chain[-1] in successor_of:
+            chain.append(successor_of[chain[-1]])
+        if len(chain) < 2:
+            continue
+        base = by_id[chain[0]]
+        for road_id in chain[1:]:
+            member = by_id[road_id]
+            shift = base.length
+
+            for geometry in member.plan_view.geometries:
+                geometry.s += shift
+            base.plan_view.geometries.extend(member.plan_view.geometries)
+
+            if (
+                base.elevation_profile is not None
+                and member.elevation_profile is not None
+            ):
+                for record in member.elevation_profile.elevations:
+                    record.s += shift
+                base.elevation_profile.elevations.extend(
+                    member.elevation_profile.elevations
+                )
+
+            mapping = lane_correspondence(base) or {}
+            member_lanes = {lane.lane_id: lane for lane in _driving_lanes(member)}
+            for target_lane in _driving_lanes(base):
+                lane = member_lanes.get(mapping.get(target_lane.lane_id))
+                if lane is None:
+                    continue
+                for attribute in (
+                    "widths",
+                    "road_marks",
+                    "borders",
+                    "heights",
+                    "speeds",
+                    "accesses",
+                ):
+                    records = getattr(lane, attribute, None) or []
+                    for record in records:
+                        record.s_offset += shift
+                    existing = getattr(target_lane, attribute, None)
+                    if existing is not None:
+                        existing.extend(records)
+                target_lane.successor = getattr(lane, "successor", None)
+
+            for collection in ("objects", "signals"):
+                items = getattr(member, collection, None) or []
+                for item in items:
+                    if hasattr(item, "s"):
+                        item.s += shift
+                if items:
+                    if getattr(base, collection, None) is None:
+                        setattr(base, collection, [])
+                    getattr(base, collection).extend(items)
+
+            base.length += member.length
+            base.link.successor = member.link.successor
+            base.reference_end_xyz = member.reference_end_xyz
+            removed.add(road_id)
+
+        # Whatever the chain's last road pointed at must now name the base.
+        tail = chain[-1]
+        for road in roads:
+            if road.id in removed or road.link is None:
+                continue
+            for side in ("predecessor", "successor"):
+                end = getattr(road.link, side)
+                if (
+                    end is not None
+                    and end.element_type == ElementType.ROAD
+                    and int(end.element_id) == tail
+                ):
+                    end.element_id = base.id
+        for junction in junctions:
+            for connection in junction.connections:
+                if int(connection.incoming_road) == tail:
+                    connection.incoming_road = base.id
+
+        merged.append(
+            MergedChain(
+                base_road_id=base.id,
+                absorbed_road_ids=chain[1:],
+                total_length=base.length,
+            )
+        )
+
+    if removed:
+        roads[:] = [road for road in roads if road.id not in removed]
+
+    return merged
+
+
 def _lane_by_id(road: Road, lane_id: int):
     """Return the lane with ``lane_id`` in the road's first section."""
     for lane in _driving_lanes(road):
@@ -1044,16 +1292,22 @@ def absorb_degenerate_stubs(
     roads: List[Road],
     junctions: Sequence[Junction],
     *,
-    min_length: float = VISSIM_MIN_CONNECTOR_LENGTH,
+    min_length: float = DEFAULT_ABSORB_MAX_LENGTH,
 ) -> List[Tuple[int, int, int, bool]]:
-    """Replace 1 cm stub roads with a direct link between their neighbours.
+    """Replace stub roads with a direct link between their neighbours.
 
-    The divergence synthesis emits a 0.01 m connecting road per lane-level
-    movement so CARLA's loader has something to follow. In Vissim such a road
-    becomes a 1 cm link — below its 0.5 m minimum spline spacing — and the
-    movement through it is unreliable. Because the stub is 1 cm long,
-    deleting it and joining its neighbours directly changes the geometry by
-    at most that centimetre.
+    Two things leave stubs behind. The divergence synthesis emits a 0.01 m
+    connecting road per lane-level movement so CARLA's loader has something to
+    follow, and dissolving a non-intersection junction turns its connecting
+    roads into ordinary roads — so a connector that was naturally a metre or
+    two long arrives as a link that short. Either way Vissim gets a fragment
+    where it should have a connector: 1 cm is below its 0.5 m minimum spline
+    spacing, and a 2 m link between two connectors is what a fragmented
+    network looks like.
+
+    Joining the neighbours directly leaves them ``min_length`` apart at most,
+    and Vissim spans that with a connector — which is the right object for a
+    couple of metres.
 
     Only stubs outside a junction are touched (the junction dissolve runs
     first), and only when a road-level link is still free to carry the

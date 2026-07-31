@@ -109,6 +109,10 @@ class VissimConfig:
             road surface at zero, ``"mean"`` centres the network, ``"none"``
             keeps absolute elevation, and a float shifts by that many metres.
             Only a constant offset is applied, so every gradient is preserved.
+        merge_consecutive_roads: Join roads that follow one another end to end
+            into a single road. A carriageway is emitted per source lanelet
+            group, so a straight run can be several roads, and each becomes
+            its own Vissim link joined by a connector — a fragmented network.
         merge_parallel_lane_roads: Merge roads that are per-lane halves of one
             carriageway back into a single road. Only roads agreeing on both
             link ends are merged, so the merged road inherits them unchanged.
@@ -119,11 +123,17 @@ class VissimConfig:
             becomes a connecting road that starts far upstream and runs
             alongside the through carriageway. ``straight`` is never removed.
             Applied to the loaded map before conversion.
-        absorb_degenerate_stubs: Replace the 0.01 m stub connecting roads the
-            divergence synthesis emits with a direct link between their
-            neighbours. In Vissim such a stub becomes a 1 cm link, below its
-            0.5 m minimum spline spacing, and traffic through it is
-            unreliable. Applied in the pipeline by ``vissim_topology``.
+        absorb_degenerate_stubs: Replace stub roads shorter than
+            ``absorb_stub_max_length`` with a direct link between their
+            neighbours. Both the 0.01 m divergence stubs and the one- to
+            two-metre connecting roads left behind by dissolving a junction
+            arrive in Vissim as fragments where a connector belongs; joining
+            the neighbours hands the stretch back to one. Applied in the
+            pipeline by ``vissim_topology``.
+        absorb_stub_max_length: Length below which a road counts as a stub
+            (metres). Default 3.0 — long enough to catch a dissolved
+            junction's connectors, short enough that the gap the neighbours
+            are left with is a plausible connector.
         merge_overlapping_junctions: Merge junctions whose connecting roads
             attach to the same road endpoint. The divergence synthesis can
             emit chained junctions that meet at one physical point (two
@@ -143,8 +153,10 @@ class VissimConfig:
     dissolve_non_intersection_junctions: bool = True
     elevation_baseline: Union[str, float] = "min"
     absorb_degenerate_stubs: bool = True
+    absorb_stub_max_length: float = 3.0
     untag_straight_turn_lanelets: bool = True
     merge_parallel_lane_roads: bool = True
+    merge_consecutive_roads: bool = True
 
     def __post_init__(self) -> None:
         if self.param_poly3_p_range not in _P_RANGE_MODES:

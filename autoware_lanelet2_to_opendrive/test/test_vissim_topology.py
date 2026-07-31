@@ -768,6 +768,36 @@ def test_long_connector_is_not_absorbed():
     assert 34 not in [stub for stub, _, _, _ in absorbed]
 
 
+def test_dissolved_junction_connector_of_a_few_metres_is_absorbed():
+    """Dissolving a junction turns its connectors into short links.
+
+    A connector that was naturally a metre or two long then arrives as a link
+    that short, which is what a fragmented network looks like. The default
+    threshold reaches it; joining the neighbours hands the stretch back to a
+    connector.
+    """
+    roads = _stub_network()
+    by_id = {road.id: road for road in roads}
+    by_id[34].length = 1.81
+
+    absorbed = absorb_degenerate_stubs(roads, [])
+
+    assert 34 in [stub for stub, _, _, _ in absorbed]
+    assert 34 not in [road.id for road in roads]
+    assert by_id[26].link.successor.element_id == 23
+
+
+def test_absorb_threshold_is_configurable():
+    roads = _stub_network()
+    by_id = {road.id: road for road in roads}
+    by_id[34].length = 1.81
+
+    absorbed = absorb_degenerate_stubs(roads, [], min_length=0.5)
+
+    assert 34 not in [stub for stub, _, _, _ in absorbed]
+    assert 34 in [road.id for road in roads]
+
+
 # ---------------------------------------------------------------------------
 # untag_straight_turn_lanelets
 # ---------------------------------------------------------------------------

@@ -82,6 +82,15 @@ vissim:
   #   <number> — shift by that many metres
   elevation_baseline: "min"
 
+  # Join roads that follow one another end to end into a single road. A
+  # carriageway is emitted per source lanelet group, so a straight run of
+  # unchanging cross-section can still be several roads, and each becomes its
+  # own Vissim link joined by a connector (Odaiba roads 8/9/10/0 are one
+  # 126 m single-lane road cut into four). Only unambiguous joints are
+  # merged: same lane ids continuing as themselves, and no third road or
+  # junction referencing either end.
+  merge_consecutive_roads: true
+
   # Merge roads that are the per-lane halves of one carriageway back into a
   # single road. The divergence synthesis can emit each lane as its own road
   # (Odaiba roads 23 and 24 run 3.27 m apart with a 0.03 deg heading
@@ -99,12 +108,16 @@ vissim:
   # removed, since inside an intersection that is the correct description.
   untag_straight_turn_lanelets: true
 
-  # Replace the 0.01 m stub connecting roads the divergence synthesis emits
-  # with a direct link between their neighbours. In Vissim a 1 cm link is
-  # below the 0.5 m minimum spline spacing and traffic through it is
-  # unreliable; the stub is 1 cm long, so joining its neighbours directly
-  # changes the geometry by at most that centimetre.
+  # Replace stub roads with a direct link between their neighbours. Two
+  # things leave stubs behind: the 0.01 m connecting roads the divergence
+  # synthesis emits for CARLA's loader, and the one- to two-metre connecting
+  # roads left when a non-intersection junction is dissolved. Either way
+  # Vissim gets a fragment where a connector belongs (1 cm is below its 0.5 m
+  # minimum spline spacing; a 2 m link between two connectors is what a
+  # fragmented network looks like). Joining the neighbours leaves them at
+  # most absorb_stub_max_length apart, which Vissim spans with a connector.
   absorb_degenerate_stubs: true
+  absorb_stub_max_length: 3.0  # metres
 
   # Turn junctions that carry no crossing movement into ordinary road links.
   # Vissim places a node — with the whole intersection machinery, including
