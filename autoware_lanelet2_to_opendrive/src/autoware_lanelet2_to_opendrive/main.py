@@ -2994,6 +2994,11 @@ def preprocess_and_convert_with_hydra(
         absorb_degenerate_stubs=(
             vissim_dict.get("absorb_degenerate_stubs", True) if vissim_dict else True
         ),
+        untag_straight_turn_lanelets=(
+            vissim_dict.get("untag_straight_turn_lanelets", True)
+            if vissim_dict
+            else True
+        ),
     )
     if vissim_config.enabled and vissim_config.local_geo_reference:
         # The local-frame PROJ string needs the resolved MGRS grid and the
@@ -3039,6 +3044,33 @@ def preprocess_and_convert_with_hydra(
         emission_geometry=emission_config,
         vissim=vissim_config,
     )
+
+    # The junction-lanelet criterion is the turn_direction attribute, and
+    # Autoware sets it from where a turn pocket opens rather than from where
+    # the turn begins. Untag the straight ones before conversion so a pocket
+    # is grouped as an ordinary lane instead of becoming a connecting road
+    # that runs alongside the through carriageway.
+    untagged_turn_lanelets: list[int] = []
+    if conversion_config.vissim.enabled and (
+        conversion_config.vissim.untag_straight_turn_lanelets
+    ):
+        from autoware_lanelet2_to_opendrive.vissim_topology import (
+            untag_straight_turn_lanelets,
+        )
+
+        untagged = untag_straight_turn_lanelets(lanelet_map)
+        untagged_turn_lanelets = [lanelet_id for lanelet_id, _, _ in untagged]
+        if untagged:
+            logger.info(
+                "Vissim topology: dropped turn_direction from %d lanelet(s) "
+                "that do not turn (an opening turn pocket, not the interior "
+                "of an intersection): %s",
+                len(untagged),
+                ", ".join(
+                    f"{lanelet_id} ({direction}, {change:+.1f} deg)"
+                    for lanelet_id, direction, change in untagged
+                ),
+            )
 
     # mgrs_code is already stored in conversion_config.origin.mgrs_code;
     # no need to pass it as a separate argument.
@@ -3097,6 +3129,7 @@ def preprocess_and_convert_with_hydra(
             lanelet_to_emitted_segments=mapping.lanelet_to_emitted_segments,
             junction_emission_plans=mapping.junction_emission_plans,
             dissolved_junction_roads=mapping.dissolved_junction_roads,
+            untagged_turn_lanelets=untagged_turn_lanelets or None,
         )
 
         # Save preprocessed OSM next to XODR so that standalone `analyze`

@@ -109,6 +109,13 @@ class VissimConfig:
             road surface at zero, ``"mean"`` centres the network, ``"none"``
             keeps absolute elevation, and a float shifts by that many metres.
             Only a constant offset is applied, so every gradient is preserved.
+        untag_straight_turn_lanelets: Drop ``turn_direction`` from lanelets
+            that carry ``left``/``right`` while running straight. Autoware
+            tags a turn lane from where its pocket opens, but the converter
+            reads the attribute as "inside an intersection", so the pocket
+            becomes a connecting road that starts far upstream and runs
+            alongside the through carriageway. ``straight`` is never removed.
+            Applied to the loaded map before conversion.
         absorb_degenerate_stubs: Replace the 0.01 m stub connecting roads the
             divergence synthesis emits with a direct link between their
             neighbours. In Vissim such a stub becomes a 1 cm link, below its
@@ -133,6 +140,7 @@ class VissimConfig:
     dissolve_non_intersection_junctions: bool = True
     elevation_baseline: Union[str, float] = "min"
     absorb_degenerate_stubs: bool = True
+    untag_straight_turn_lanelets: bool = True
 
     def __post_init__(self) -> None:
         if self.param_poly3_p_range not in _P_RANGE_MODES:

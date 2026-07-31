@@ -82,6 +82,15 @@ vissim:
   #   <number> — shift by that many metres
   elevation_baseline: "min"
 
+  # Autoware tags a turn lane from where its POCKET OPENS, not from where the
+  # turn begins, but the converter reads turn_direction as "this lanelet is
+  # inside an intersection". A straight pocket therefore becomes a connecting
+  # road that starts far upstream and runs alongside the through carriageway
+  # (Odaiba: 119 m connectors over the neighbouring roads). Drop the attribute
+  # from left/right lanelets that do not actually turn; "straight" is never
+  # removed, since inside an intersection that is the correct description.
+  untag_straight_turn_lanelets: true
+
   # Replace the 0.01 m stub connecting roads the divergence synthesis emits
   # with a direct link between their neighbours. In Vissim a 1 cm link is
   # below the 0.5 m minimum spline spacing and traffic through it is

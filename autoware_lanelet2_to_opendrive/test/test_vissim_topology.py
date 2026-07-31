@@ -766,3 +766,101 @@ def test_long_connector_is_not_absorbed():
     by_id[34].length = 25.0
     absorbed = absorb_degenerate_stubs(roads, [])
     assert 34 not in [stub for stub, _, _, _ in absorbed]
+
+
+# ---------------------------------------------------------------------------
+# untag_straight_turn_lanelets
+# ---------------------------------------------------------------------------
+
+
+class _FakeAttributes(dict):
+    """Stands in for lanelet2's AttributeMap, which has no ``get``."""
+
+    def get(self, *args, **kwargs):  # pragma: no cover - must not be used
+        raise AttributeError("AttributeMap has no 'get'")
+
+
+class _FakePoint:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+
+
+class _FakeLanelet:
+    def __init__(self, lanelet_id, direction, points):
+        self.id = lanelet_id
+        self.attributes = _FakeAttributes()
+        if direction is not None:
+            self.attributes["turn_direction"] = direction
+        self.centerline = [_FakePoint(x, y) for x, y in points]
+
+
+class _FakeMap:
+    def __init__(self, lanelets):
+        self.laneletLayer = lanelets
+
+
+def _straight(n=5, length=30.0):
+    return [(length * i / (n - 1), 0.0) for i in range(n)]
+
+
+def _quarter_turn(n=9, radius=20.0):
+    return [
+        (
+            radius * math.sin(math.pi / 2 * i / (n - 1)),
+            radius * (1 - math.cos(math.pi / 2 * i / (n - 1))),
+        )
+        for i in range(n)
+    ]
+
+
+def test_straight_left_right_lanelets_lose_the_tag():
+    """An opening turn pocket is tagged but does not turn."""
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        untag_straight_turn_lanelets,
+    )
+
+    pocket = _FakeLanelet(1, "right", _straight())
+    lanelet_map = _FakeMap([pocket])
+
+    untagged = untag_straight_turn_lanelets(lanelet_map)
+
+    assert [lid for lid, _, _ in untagged] == [1]
+    assert untagged[0][1] == "right"
+    assert abs(untagged[0][2]) < 1.0
+    assert "turn_direction" not in pocket.attributes
+
+
+def test_a_real_turn_keeps_its_tag():
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        untag_straight_turn_lanelets,
+    )
+
+    turn = _FakeLanelet(2, "left", _quarter_turn())
+    lanelet_map = _FakeMap([turn])
+
+    assert untag_straight_turn_lanelets(lanelet_map) == []
+    assert "turn_direction" in turn.attributes
+
+
+def test_straight_tag_is_never_removed():
+    """Inside an intersection, turn_direction=straight is correct."""
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        untag_straight_turn_lanelets,
+    )
+
+    through = _FakeLanelet(3, "straight", _straight())
+    lanelet_map = _FakeMap([through])
+
+    assert untag_straight_turn_lanelets(lanelet_map) == []
+    assert str(through.attributes["turn_direction"]) == "straight"
+
+
+def test_untag_tolerance_is_configurable():
+    from autoware_lanelet2_to_opendrive.vissim_topology import (
+        untag_straight_turn_lanelets,
+    )
+
+    turn = _FakeLanelet(4, "left", _quarter_turn())
+    assert untag_straight_turn_lanelets(_FakeMap([turn]), tolerance_deg=120.0)
+    assert "turn_direction" not in turn.attributes

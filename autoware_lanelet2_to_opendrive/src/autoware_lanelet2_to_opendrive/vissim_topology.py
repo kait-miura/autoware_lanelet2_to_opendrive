@@ -64,6 +64,10 @@ DEFAULT_MIN_LINK_COVERAGE = 0.4
 #: whose turns all leave on different arms still needs the node).
 DEFAULT_MIN_INTERSECTION_ARMS = 3
 
+#: A left/right lanelet whose heading changes by less than this is an
+#: approach lane (a turn pocket), not the interior of an intersection.
+DEFAULT_STRAIGHT_TURN_TOLERANCE_DEG = 25.0
+
 #: Vissim sets spline points at a minimum spacing of 0.5 m, so a shorter
 #: connecting road cannot be represented as a proper connector.
 VISSIM_MIN_CONNECTOR_LENGTH = 0.5
@@ -371,6 +375,63 @@ def _endpoints(road: Road) -> Tuple[Optional[int], Optional[int]]:
         return int(end.element_id)
 
     return (road_id(road.link.predecessor), road_id(road.link.successor))
+
+
+def untag_straight_turn_lanelets(
+    lanelet_map,
+    *,
+    tolerance_deg: float = DEFAULT_STRAIGHT_TURN_TOLERANCE_DEG,
+) -> List[Tuple[int, str, float]]:
+    """Drop ``turn_direction`` from lanelets that do not actually turn.
+
+    Autoware tags a turn lane from where its **pocket opens**, not from where
+    the turn begins, which is right for a planner ("this lane leads to a
+    turn") but not the same statement as "this lanelet lies inside an
+    intersection". The converter uses the attribute as its junction-lanelet
+    criterion, so a pocket becomes a connecting road inside a synthesized
+    junction; consecutive junction lanelets are then chain-merged, and the
+    result is a connecting road that starts far upstream of the intersection
+    and runs alongside the through carriageway.
+
+    On the Odaiba clip 12 of the 21 tagged lanelets have a heading change
+    below 25°. Six of those are ``straight`` inside the real intersection and
+    are correct; the other six carry ``left``/``right`` while running dead
+    straight, parallel to a sibling lane. Untagging exactly those shortens
+    the longest connecting road from 119.3 m to 61.6 m and takes junction
+    1000 from 13 connections to 12.
+
+    ``straight`` is never removed — inside an intersection it is the correct
+    description of a through movement.
+
+    Args:
+        lanelet_map: The loaded Lanelet2 map (mutated in place).
+        tolerance_deg: Heading change below which a left/right lanelet is
+            treated as an approach lane rather than an intersection interior.
+
+    Returns:
+        ``(lanelet_id, turn_direction, heading_change_deg)`` per untagged
+        lanelet.
+    """
+    untagged: List[Tuple[int, str, float]] = []
+    for lanelet in lanelet_map.laneletLayer:
+        # lanelet2's AttributeMap has no ``get``; membership then lookup, and
+        # the value is an Attribute wrapper rather than a plain string.
+        if "turn_direction" not in lanelet.attributes:
+            continue
+        direction = str(lanelet.attributes["turn_direction"])
+        if direction not in ("left", "right"):
+            continue
+        points = [(point.x, point.y) for point in lanelet.centerline]
+        if len(points) < 3:
+            continue
+        entry = math.atan2(points[1][1] - points[0][1], points[1][0] - points[0][0])
+        exit_ = math.atan2(points[-1][1] - points[-2][1], points[-1][0] - points[-2][0])
+        change = math.degrees((exit_ - entry + math.pi) % (2 * math.pi) - math.pi)
+        if abs(change) >= tolerance_deg:
+            continue
+        del lanelet.attributes["turn_direction"]
+        untagged.append((lanelet.id, direction, change))
+    return untagged
 
 
 def _elevation_at(road: Road, s: float) -> Optional[float]:
