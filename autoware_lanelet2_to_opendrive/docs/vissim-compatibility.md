@@ -193,6 +193,59 @@ Note that the other map configs already set this on the input side —
 also works, but it moves the Lanelet2 origin for *every* target;
 `elevation_baseline` keeps the change inside the Vissim export.
 
+### Must be fixed in the source map — overlapping lanelets
+
+The Odaiba clip has **41 lanelet pairs whose centrelines run inside each
+other by 25 % or more, and not one of them shares a boundary linestring**.
+The pattern is uniform: a turn pocket starts at the *exact* coordinate of
+the through lane it duplicates and separates to about one lane width by
+its end.
+
+| pocket | through lane | boundaries (pocket / through) | centreline gap start → end | pocket length |
+|---|---|---|---|---|
+| 176324 (`right`) | 176323 | 176314 / 176316 vs 176318 / 176315 | 0.00 → 3.18 m | 27.4 m |
+| 1494 | 1514 | 555 / 556 vs 553 / 554 | 0.00 → 3.32 m | 54.0 m |
+| 176191 (`left`) | 176185 | 176189 / 176190 vs 176184 / 175959 | 0.00 → 3.51 m | 29.9 m |
+| 190217 (`left`) | 1520 | 190200 / 190202 vs 572 / 573 | 0.00 → 83.82 m | 9.0 m |
+
+The through lanes themselves are stitched correctly — lanelet 1514 has
+bounds 553 / 554 and its neighbour 1493 has 552 / **553**, sharing one
+linestring, which is how Lanelet2 expresses adjacency. The pockets share
+nothing, so they are independent polygons occupying the through lane's
+ground rather than lanes beside it.
+
+**Why the converter cannot repair it.** Within one OpenDRIVE road, lanes
+are stacked side by side by width, so a lane cannot lie on top of another;
+merging the pair is impossible. Trimming the pocket to the part that is
+clear would halve a 54 m storage lane and break the mapping validation,
+which compares the emitted geometry against the lanelet centreline.
+
+**What it costs if left alone.** On the Odaiba clip 59.5 m of 3336
+lane-metres (1.78 %) is duplicated, always one lane of each road:
+
+| pair | overlap | same origin and destination |
+|---|---|---|
+| road 26 / 28 | 27.5 m | yes — a duplicated lane |
+| road 36 / 37 | 22.8 m | yes |
+| road 16 / 17 | 17.0 m | no |
+| road 5 / 7 | 13.7 m | yes |
+| road 16 / 33, 15 / 74, 74 / 75 | 2.8–4.5 m | no |
+
+Flow-level results (volumes, travel times, queues) survive that: the
+stretches are short and the duplicated pairs share an origin and
+destination, so total demand is preserved. What does not survive is
+anything lane-level — the stretch carries one lane more capacity than the
+ground truth, Vissim's auto-generated conflict area there defaults to
+passive so vehicles pass through each other, safety measures such as SSAM
+see conflicts that do not exist, and a lane-level comparison against an
+Autoware trajectory has no single answer for "which road is that lane".
+
+`analyze_topology` reports every pair with its overlap length and whether
+the two share an origin and destination, so the list can go straight to
+whoever maintains the map. **The fix is to stitch each pocket into its lane
+group**: give it the through lane's boundary on the shared side so the
+polygons become adjacent, or start it where it has actually separated.
+
 ### Known, not fixable at write time
 
 - **Conflict-area priority warnings** (`The priority of conflict area "N"

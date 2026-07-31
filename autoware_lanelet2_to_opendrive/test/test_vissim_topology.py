@@ -1041,3 +1041,73 @@ def test_one_sided_road_link_is_left_alone():
 
     assert reciprocate_lane_links([upstream, downstream]) == 0
     assert downstream.lanes.lane_sections[0].left_lanes[1].predecessor is None
+
+
+# ---------------------------------------------------------------------------
+# overlapping through roads
+# ---------------------------------------------------------------------------
+
+
+def _overlapping_pocket():
+    """A pocket road laid on top of a through lane, as the Odaiba map has it.
+
+    Lanelets 1494 and 1514 start at the same coordinate and separate to
+    3.3 m, so the emitted roads share ground over half their length.
+    """
+    through = _road(26, x=0.0, y=0.0, hdg=0.0, length=54.0, lane_widths=(3.3, 3.3, 3.3))
+    pocket = _road(28, x=0.0, y=0.0, hdg=-0.03, length=54.0, lane_widths=(3.3,))
+    for road in (through, pocket):
+        road.link = RoadLink(
+            predecessor=Predecessor(ElementType.ROAD, 24, ContactPoint.END),
+            successor=Successor(ElementType.ROAD, 27, ContactPoint.START),
+        )
+    return [through, pocket]
+
+
+def test_overlapping_through_roads_are_reported():
+    roads = _overlapping_pocket()
+
+    report = analyze_topology(roads, [])
+
+    assert len(report.overlapping_roads) == 1
+    pair = report.overlapping_roads[0]
+    assert {pair.first_road_id, pair.second_road_id} == {26, 28}
+    assert pair.overlap_length > 10.0
+    assert pair.same_origin_destination is True
+    assert 1 in pair.first_lanes and 1 in pair.second_lanes
+    # Reporting only: the network is untouched.
+    assert sorted(road.id for road in roads) == [26, 28]
+
+
+def test_side_by_side_roads_are_not_reported_as_overlapping():
+    """Adjacent carriageways must not be flagged; only shared ground is."""
+    roads = _overlapping_pocket()
+    by_id = {road.id: road for road in roads}
+    # Move the pocket clear of the through carriageway.
+    by_id[28].plan_view.geometries[0].y = -4.0
+    by_id[28].plan_view.geometries[0].hdg = 0.0
+
+    assert analyze_topology(roads, []).overlapping_roads == []
+
+
+def test_connected_roads_are_not_reported_as_overlapping():
+    """A road always meets its own neighbour; that is not shared ground."""
+    upstream = _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    downstream = _road(2, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    upstream.link = RoadLink(
+        successor=Successor(ElementType.ROAD, 2, ContactPoint.START)
+    )
+    downstream.link = RoadLink(
+        predecessor=Predecessor(ElementType.ROAD, 1, ContactPoint.END)
+    )
+
+    assert analyze_topology([upstream, downstream], []).overlapping_roads == []
+
+
+def test_connecting_roads_are_excluded_from_the_overlap_check():
+    """Turning paths inside a junction legitimately cross and overlap."""
+    roads = _overlapping_pocket()
+    for road in roads:
+        road.junction = 1000
+
+    assert analyze_topology(roads, []).overlapping_roads == []

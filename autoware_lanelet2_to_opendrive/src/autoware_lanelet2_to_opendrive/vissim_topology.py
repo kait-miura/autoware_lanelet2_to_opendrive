@@ -111,6 +111,18 @@ class DegenerateConnector:
 
 
 @dataclass
+class OverlappingRoads:
+    """Two through roads whose lanes occupy the same space, same direction."""
+
+    first_road_id: int
+    second_road_id: int
+    overlap_length: float
+    first_lanes: List[int]
+    second_lanes: List[int]
+    same_origin_destination: bool
+
+
+@dataclass
 class DissolvedJunction:
     """A junction that carried no crossing movement and was dissolved."""
 
@@ -125,6 +137,7 @@ class VissimTopologyReport:
     """Constructs in the emitted network that Vissim degrades on."""
 
     overlaps: List[SameStreamOverlap] = field(default_factory=list)
+    overlapping_roads: List[OverlappingRoads] = field(default_factory=list)
     degenerate_connectors: List[DegenerateConnector] = field(default_factory=list)
     dissolved_junctions: List[DissolvedJunction] = field(default_factory=list)
     kept_junctions: List[Tuple[int, int, int]] = field(default_factory=list)
@@ -172,6 +185,33 @@ class VissimTopologyReport:
                 "Vissim topology: no connector runs along a through road in "
                 "the same direction"
             )
+
+        if self.overlapping_roads:
+            log.warning(
+                "Vissim topology: %d through-road pair(s) have lanes occupying "
+                "the same space in the same direction — Vissim renders both "
+                "links there, so that stretch has one more lane than the "
+                "ground truth and vehicles pass through each other (an "
+                "auto-generated conflict area defaults to passive). This comes "
+                "from overlapping lanelets in the source map and has to be "
+                "fixed there: a turn pocket must start where it separates from "
+                "the through lane, or share a boundary with it.",
+                len(self.overlapping_roads),
+            )
+            for pair in self.overlapping_roads:
+                log.warning(
+                    "  road %d lane(s) %s overlaps road %d lane(s) %s for " "%.1f m%s",
+                    pair.first_road_id,
+                    pair.first_lanes,
+                    pair.second_road_id,
+                    pair.second_lanes,
+                    pair.overlap_length,
+                    (
+                        " (same origin and destination — a duplicated lane)"
+                        if pair.same_origin_destination
+                        else ""
+                    ),
+                )
 
         if self.degenerate_connectors:
             log.warning(
@@ -352,6 +392,108 @@ def _paths_cross(first: Road, second: Road) -> bool:
             ):
                 return True
     return False
+
+
+def _find_overlapping_roads(
+    roads: Sequence[Road],
+    *,
+    min_overlap_length: float = 2.0,
+) -> List[OverlappingRoads]:
+    """Find through roads whose lanes occupy the same space, same direction.
+
+    Two lanes of *different* roads sharing ground is not something OpenDRIVE
+    can express away: within one road, lanes are stacked side by side by
+    width, so a lane cannot lie on top of another. It only arises when the
+    source map already has overlapping lanelets — on the Odaiba clip the turn
+    pockets do, e.g. lanelets 1494 and 1514 start at the same coordinate and
+    50 % of each centreline runs inside the other polygon, with no shared
+    boundary.
+
+    Vissim renders both links, so the stretch carries one lane more than the
+    ground truth and its auto-generated conflict area defaults to passive,
+    letting vehicles pass through each other. The repair belongs in the map,
+    which is why this is reported rather than patched.
+    """
+    stations = {road.id: _band_stations(road) for road in roads}
+    found: List[OverlappingRoads] = []
+
+    for first, second in itertools.combinations(
+        [road for road in roads if road.junction == -1], 2
+    ):
+        if second.id in _linked_road_ids(first) or first.id in (
+            _linked_road_ids(second)
+        ):
+            continue
+        ours, theirs = stations[first.id], stations[second.id]
+        if not ours or not theirs or first.length <= 0.0:
+            continue
+        widths = {
+            lane.lane_id: float((getattr(lane, "widths", None) or [None])[0].a)
+            for road in (first, second)
+            for lane in _driving_lanes(road)
+            if getattr(lane, "widths", None)
+        }
+        first_ids = [lane.lane_id for lane in _driving_lanes(first)]
+        second_ids = [lane.lane_id for lane in _driving_lanes(second)]
+        if not first_ids or not second_ids:
+            continue
+
+        step = first.length / max(len(ours) - 1, 1)
+        length = 0.0
+        hit_first: Set[int] = set()
+        hit_second: Set[int] = set()
+        for points, heading in ours:
+            touched = False
+            for index, point in enumerate(points):
+                lane_id = first_ids[index] if index < len(first_ids) else None
+                for other_points, other_heading in theirs:
+                    delta = abs(
+                        (other_heading - heading + math.pi) % (2 * math.pi) - math.pi
+                    )
+                    if delta > math.radians(30.0):
+                        continue
+                    for other_index, other in enumerate(other_points):
+                        other_id = (
+                            second_ids[other_index]
+                            if other_index < len(second_ids)
+                            else None
+                        )
+                        tolerance = (
+                            min(
+                                widths.get(lane_id, 3.5),
+                                widths.get(other_id, 3.5),
+                            )
+                            * 0.5
+                        )
+                        if (
+                            math.hypot(point[0] - other[0], point[1] - other[1])
+                            < tolerance
+                        ):
+                            touched = True
+                            if lane_id is not None:
+                                hit_first.add(lane_id)
+                            if other_id is not None:
+                                hit_second.add(other_id)
+            if touched:
+                length += step
+        if length < min_overlap_length:
+            continue
+        found.append(
+            OverlappingRoads(
+                first_road_id=first.id,
+                second_road_id=second.id,
+                overlap_length=length,
+                first_lanes=sorted(hit_first),
+                second_lanes=sorted(hit_second),
+                same_origin_destination=(
+                    _link_target(first, "predecessor")
+                    == _link_target(second, "predecessor")
+                    and _link_target(first, "successor")
+                    == _link_target(second, "successor")
+                ),
+            )
+        )
+    return found
 
 
 def _linked_road_ids(road: Road) -> Set[int]:
@@ -1260,4 +1402,5 @@ def analyze_topology(
                     )
                 )
 
+    report.overlapping_roads = _find_overlapping_roads(roads)
     return report
