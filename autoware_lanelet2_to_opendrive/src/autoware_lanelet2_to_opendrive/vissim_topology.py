@@ -373,6 +373,90 @@ def _endpoints(road: Road) -> Tuple[Optional[int], Optional[int]]:
     return (road_id(road.link.predecessor), road_id(road.link.successor))
 
 
+def _elevation_at(road: Road, s: float) -> Optional[float]:
+    """Reference-line elevation of ``road`` at station ``s``."""
+    profile = road.elevation_profile
+    records = getattr(profile, "elevations", None) if profile is not None else None
+    if not records:
+        return None
+    z = None
+    for record in records:
+        if record.s > s + 1e-9:
+            break
+        ds = s - record.s
+        z = record.a + record.b * ds + record.c * ds * ds + record.d * ds**3
+    return z
+
+
+def align_connector_elevations(
+    roads: Sequence[Road],
+) -> List[Tuple[int, float, float]]:
+    """Lift each connecting road onto the neighbouring road's surface level.
+
+    A road's ``<elevationProfile>`` describes its **reference line**, which
+    for this converter sits at the inner edge of the carriageway. A
+    single-lane connecting road's reference line instead follows its own lane
+    centre, so on a cambered road the two carry different heights for what is
+    physically the same joint: on the Odaiba clip road 32 has a 1.7 % camber,
+    and its four connectors start 0.000 / 0.049 / 0.125 / 0.189 m below its
+    reference line — exactly proportional to how far their lane sits from it
+    (1.5 / 4.9 / 8.4 / 11.4 m).
+
+    Vissim renders a link flat across at the reference-line height (it
+    imports no superelevation), so those differences show up as steps at the
+    junction. Correcting each connecting road by a linear ramp — matching the
+    neighbour's reference-line height at both contact points — removes them.
+    Curvature is untouched; only ``a`` and ``b`` change, and the added
+    gradient is under 1 % for the observed offsets.
+
+    Returns ``(road_id, start_correction, end_correction)`` per adjusted road.
+    """
+    by_id = {road.id: road for road in roads}
+    adjusted: List[Tuple[int, float, float]] = []
+
+    for road in roads:
+        if road.junction == -1 or road.link is None:
+            continue
+        profile = road.elevation_profile
+        records = getattr(profile, "elevations", None) if profile is not None else None
+        if not records or road.length <= 0.0:
+            continue
+
+        def target(end) -> Optional[float]:
+            if end is None or end.element_type != ElementType.ROAD:
+                return None
+            neighbour = by_id.get(int(end.element_id))
+            if neighbour is None:
+                return None
+            at = 0.0 if end.contact_point == ContactPoint.START else neighbour.length
+            return _elevation_at(neighbour, at)
+
+        own_start = _elevation_at(road, 0.0)
+        own_end = _elevation_at(road, road.length)
+        want_start = target(road.link.predecessor)
+        want_end = target(road.link.successor)
+        if own_start is None or own_end is None:
+            continue
+        # With only one neighbour known, shift by that offset alone.
+        delta_start = want_start - own_start if want_start is not None else None
+        delta_end = want_end - own_end if want_end is not None else None
+        if delta_start is None and delta_end is None:
+            continue
+        if delta_start is None:
+            delta_start = delta_end
+        if delta_end is None:
+            delta_end = delta_start
+        if abs(delta_start) < 1e-9 and abs(delta_end) < 1e-9:
+            continue
+
+        slope = (delta_end - delta_start) / road.length
+        for record in records:
+            record.a += delta_start + slope * record.s
+            record.b += slope
+        adjusted.append((road.id, delta_start, delta_end))
+    return adjusted
+
+
 def _driving_lanes(road: Road) -> List:
     """Lanes of the road's first section, center lane excluded."""
     if road.lanes is None or not road.lanes.lane_sections:
@@ -421,6 +505,120 @@ def _rewire_lane_links(
     for lane in _driving_lanes(neighbour):
         target = mapping.get(int(lane.lane_id))
         setattr(lane, side, LaneLink(id=target) if target is not None else None)
+
+
+def _lane_by_id(road: Road, lane_id: int):
+    """Return the lane with ``lane_id`` in the road's first section."""
+    for lane in _driving_lanes(road):
+        if lane.lane_id == lane_id:
+            return lane
+    return None
+
+
+def absorb_degenerate_stubs(
+    roads: List[Road],
+    junctions: Sequence[Junction],
+    *,
+    min_length: float = VISSIM_MIN_CONNECTOR_LENGTH,
+) -> List[Tuple[int, int, int, bool]]:
+    """Replace 1 cm stub roads with a direct link between their neighbours.
+
+    The divergence synthesis emits a 0.01 m connecting road per lane-level
+    movement so CARLA's loader has something to follow. In Vissim such a road
+    becomes a 1 cm link — below its 0.5 m minimum spline spacing — and the
+    movement through it is unreliable. Because the stub is 1 cm long,
+    deleting it and joining its neighbours directly changes the geometry by
+    at most that centimetre.
+
+    Only stubs outside a junction are touched (the junction dissolve runs
+    first), and only when a road-level link is still free to carry the
+    movement: OpenDRIVE allows one predecessor and one successor per road, so
+    at a merge the second branch is expressed from whichever side is
+    available. A stub whose movement cannot be expressed at all is kept.
+
+    Returns ``(stub_id, from_road, to_road, reciprocal)`` per absorbed stub.
+    """
+    in_junction = {
+        int(connection.connecting_road)
+        for junction in junctions
+        for connection in junction.connections
+    }
+    by_id = {road.id: road for road in roads}
+    absorbed: List[Tuple[int, int, int, bool]] = []
+    removed: Set[int] = set()
+
+    for stub in sorted(roads, key=lambda r: r.id):
+        if (
+            stub.id in in_junction
+            or stub.junction != -1
+            or stub.length >= min_length
+            or stub.link is None
+        ):
+            continue
+        upstream_id, downstream_id = _endpoints(stub)
+        if upstream_id is None or downstream_id is None:
+            continue
+        upstream = by_id.get(upstream_id)
+        downstream = by_id.get(downstream_id)
+        if upstream is None or downstream is None:
+            continue
+
+        # (upstream lane -> downstream lane) pairs the stub carried.
+        movements: List[Tuple[int, int]] = []
+        for lane in _driving_lanes(stub):
+            entry = getattr(lane, "predecessor", None)
+            exit_ = getattr(lane, "successor", None)
+            if entry is not None and exit_ is not None:
+                movements.append((int(entry.id), int(exit_.id)))
+        if not movements:
+            continue
+
+        def names(road: Road, side: str, target: int) -> bool:
+            end = getattr(road.link, side, None) if road.link is not None else None
+            return (
+                end is not None
+                and end.element_type == ElementType.ROAD
+                and int(end.element_id) == target
+            )
+
+        forward_free = upstream.link is not None and (
+            upstream.link.successor is None
+            or names(upstream, "successor", stub.id)
+            or names(upstream, "successor", downstream_id)
+        )
+        backward_free = downstream.link is not None and (
+            downstream.link.predecessor is None
+            or names(downstream, "predecessor", stub.id)
+            or names(downstream, "predecessor", upstream_id)
+        )
+        if not forward_free and not backward_free:
+            continue
+
+        if forward_free:
+            upstream.link.successor = Successor(
+                ElementType.ROAD, downstream_id, ContactPoint.START
+            )
+            for from_lane, to_lane in movements:
+                lane = _lane_by_id(upstream, from_lane)
+                if lane is not None:
+                    lane.successor = LaneLink(id=to_lane)
+        if backward_free:
+            downstream.link.predecessor = Predecessor(
+                ElementType.ROAD, upstream_id, ContactPoint.END
+            )
+            for from_lane, to_lane in movements:
+                lane = _lane_by_id(downstream, to_lane)
+                if lane is not None:
+                    lane.predecessor = LaneLink(id=from_lane)
+
+        removed.add(stub.id)
+        absorbed.append(
+            (stub.id, upstream_id, downstream_id, forward_free and backward_free)
+        )
+
+    if removed:
+        roads[:] = [road for road in roads if road.id not in removed]
+    return absorbed
 
 
 def _is_intersection(

@@ -2590,11 +2590,28 @@ class _Lanelet2ToOpenDRIVEConverter:
         # Gated on the Vissim export profile.
         if self.config.vissim.enabled:
             from autoware_lanelet2_to_opendrive.vissim_topology import (
+                absorb_degenerate_stubs,
+                align_connector_elevations,
                 analyze_topology,
                 dissolve_non_intersection_junctions,
             )
 
             print("\n=== Vissim topology pass ===")
+            # Runs while road.junction still marks the connecting roads.
+            aligned = align_connector_elevations(final_roads)
+            if aligned:
+                logger.info(
+                    "Vissim topology: lifted %d connecting road(s) onto the "
+                    "neighbouring surface level (the road elevation profile "
+                    "describes the reference line, a connector's follows its "
+                    "own lane centre, so a cambered road leaves a step); "
+                    "largest correction %+.3f m",
+                    len(aligned),
+                    max(
+                        (max(a, b, key=abs) for _, a, b in aligned),
+                        key=abs,
+                    ),
+                )
             if self.config.vissim.dissolve_non_intersection_junctions:
                 dissolve_report = dissolve_non_intersection_junctions(
                     final_roads, junctions
@@ -2608,6 +2625,20 @@ class _Lanelet2ToOpenDRIVEConverter:
                     for dissolved in dissolve_report.dissolved_junctions
                     for road_id in dissolved.connecting_roads
                 )
+            if self.config.vissim.absorb_degenerate_stubs:
+                stubs = absorb_degenerate_stubs(final_roads, junctions)
+                if stubs:
+                    logger.info(
+                        "Vissim topology: absorbed %d stub road(s) below "
+                        "Vissim's %.1f m minimum into direct links: %s",
+                        len(stubs),
+                        0.5,
+                        ", ".join(
+                            f"road {s} ({a} -> {b}"
+                            f"{', one-sided' if not both else ''})"
+                            for s, a, b, both in stubs
+                        ),
+                    )
             analyze_topology(final_roads, junctions).log(logger)
 
         # Step 7: Write OpenDRIVE output
@@ -2959,6 +2990,9 @@ def preprocess_and_convert_with_hydra(
         ),
         elevation_baseline=(
             vissim_dict.get("elevation_baseline", "min") if vissim_dict else "min"
+        ),
+        absorb_degenerate_stubs=(
+            vissim_dict.get("absorb_degenerate_stubs", True) if vissim_dict else True
         ),
     )
     if vissim_config.enabled and vissim_config.local_geo_reference:

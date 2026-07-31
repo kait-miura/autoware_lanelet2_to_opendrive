@@ -34,8 +34,14 @@ from autoware_lanelet2_to_opendrive.opendrive.road_links import (
     RoadLink,
     Successor,
 )
+from autoware_lanelet2_to_opendrive.opendrive.elevation import (
+    Elevation,
+    ElevationProfile,
+)
 from autoware_lanelet2_to_opendrive.vissim_topology import (
     _same_stream_coverage,
+    absorb_degenerate_stubs,
+    align_connector_elevations,
     analyze_topology,
     dissolve_non_intersection_junctions,
 )
@@ -616,3 +622,147 @@ def test_lane_without_a_correspondence_is_cleared_not_left_dangling():
     dissolve_non_intersection_junctions(roads, junctions)
 
     assert by_id[3].lanes.lane_sections[0].left_lanes[4].predecessor is None
+
+
+# ---------------------------------------------------------------------------
+# align_connector_elevations
+# ---------------------------------------------------------------------------
+
+
+def _with_elevation(road: Road, *records) -> Road:
+    road.elevation_profile = ElevationProfile(
+        elevations=[Elevation(s=s, a=a, b=b) for s, a, b in records]
+    )
+    return road
+
+
+def test_connector_is_lifted_onto_the_neighbouring_surface_level():
+    """A cambered road leaves the connector below its lane; close the step.
+
+    The road's profile describes its reference line while the connector's
+    follows its own lane centre, so on a camber the two disagree at what is
+    physically one joint.
+    """
+    upstream = _with_elevation(
+        _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0), (0.0, 5.0, 0.0)
+    )
+    downstream = _with_elevation(
+        _road(3, x=50.0, y=0.0, hdg=0.0, length=30.0), (0.0, 6.0, 0.0)
+    )
+    connector = _with_elevation(
+        _connector(
+            2,
+            x=30.0,
+            y=0.0,
+            hdg=0.0,
+            length=20.0,
+            junction=100,
+            predecessor=1,
+            successor=3,
+        ),
+        (0.0, 4.8, 0.0),
+        (10.0, 4.8, 0.0),
+    )
+    roads = [upstream, downstream, connector]
+
+    adjusted = align_connector_elevations(roads)
+
+    assert [road_id for road_id, _, _ in adjusted] == [2]
+    records = connector.elevation_profile.elevations
+    # Start now matches road 1's end (5.0) and end matches road 3's start (6.0).
+    assert records[0].a == pytest.approx(5.0)
+    ramp = records[-1]
+    z_end = ramp.a + ramp.b * (20.0 - ramp.s)
+    assert z_end == pytest.approx(6.0)
+    # A pure ramp: under 1 % extra gradient for a 1.2 m correction over 20 m.
+    assert abs(records[0].b) < 0.07
+
+
+def test_through_roads_are_not_touched_by_the_elevation_alignment():
+    plain = _with_elevation(
+        _road(1, x=0.0, y=0.0, hdg=0.0, length=30.0), (0.0, 5.0, 0.01)
+    )
+    other = _with_elevation(
+        _road(2, x=31.0, y=0.0, hdg=0.0, length=30.0), (0.0, 9.0, 0.0)
+    )
+    plain.link = RoadLink(successor=Successor(ElementType.ROAD, 2, ContactPoint.START))
+    assert align_connector_elevations([plain, other]) == []
+    assert plain.elevation_profile.elevations[0].a == 5.0
+
+
+# ---------------------------------------------------------------------------
+# absorb_degenerate_stubs
+# ---------------------------------------------------------------------------
+
+
+def _stub_network():
+    """Two upstream roads merging into one via 1 cm stubs (Odaiba 11000)."""
+    left = _road(26, x=0.0, y=0.0, hdg=0.0, length=30.0)
+    right = _road(25, x=0.0, y=10.0, hdg=0.0, length=30.0, lane_widths=(3.5, 3.5))
+    target = _road(
+        23, x=30.01, y=5.0, hdg=0.0, length=30.0, lane_widths=(3.5, 3.5, 3.5)
+    )
+    stubs = []
+    for stub_id, up, pairs in (
+        (34, 26, [(1, 1)]),
+        (35, 25, [(1, 2)]),
+        (36, 25, [(2, 3)]),
+    ):
+        stub = _connector(
+            stub_id,
+            x=30.0,
+            y=5.0,
+            hdg=0.0,
+            length=0.01,
+            junction=-1,
+            predecessor=up,
+            successor=23,
+        )
+        lane = stub.lanes.lane_sections[0].left_lanes[1]
+        lane.predecessor = LaneElementLink(id=pairs[0][0])
+        lane.successor = LaneElementLink(id=pairs[0][1])
+        stubs.append(stub)
+    left.link = RoadLink(successor=Successor(ElementType.ROAD, 34, ContactPoint.START))
+    right.link = RoadLink(successor=Successor(ElementType.ROAD, 35, ContactPoint.START))
+    target.link = RoadLink(
+        predecessor=Predecessor(ElementType.ROAD, 34, ContactPoint.END)
+    )
+    return [left, right, target] + stubs
+
+
+def test_degenerate_stubs_become_direct_links():
+    roads = _stub_network()
+    absorbed = absorb_degenerate_stubs(roads, [])
+
+    assert [stub for stub, _, _, _ in absorbed] == [34, 35, 36]
+    # All three 1 cm roads are gone.
+    assert sorted(road.id for road in roads) == [23, 25, 26]
+
+    by_id = {road.id: road for road in roads}
+    # Road 26 -> road 23 is reciprocal: both ends were free.
+    assert by_id[26].link.successor.element_id == 23
+    assert by_id[23].link.predecessor.element_id == 26
+    assert by_id[26].lanes.lane_sections[0].left_lanes[1].successor.id == 1
+    # Road 25 -> road 23 is expressed from road 25 only: road 23's
+    # predecessor was already taken, which OpenDRIVE cannot express twice.
+    assert by_id[25].link.successor.element_id == 23
+    right_lanes = by_id[25].lanes.lane_sections[0].left_lanes
+    assert right_lanes[1].successor.id == 2
+    assert right_lanes[2].successor.id == 3
+
+
+def test_stub_inside_a_kept_junction_is_left_alone():
+    """A real intersection keeps its connectors, degenerate or not."""
+    roads = _stub_network()
+    junction = _junction(1000, (26, 34))
+    absorbed = absorb_degenerate_stubs(roads, [junction])
+    assert 34 not in [stub for stub, _, _, _ in absorbed]
+    assert 34 in [road.id for road in roads]
+
+
+def test_long_connector_is_not_absorbed():
+    roads = _stub_network()
+    by_id = {road.id: road for road in roads}
+    by_id[34].length = 25.0
+    absorbed = absorb_degenerate_stubs(roads, [])
+    assert 34 not in [stub for stub, _, _, _ in absorbed]

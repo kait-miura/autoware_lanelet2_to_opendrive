@@ -82,6 +82,13 @@ vissim:
   #   <number> — shift by that many metres
   elevation_baseline: "min"
 
+  # Replace the 0.01 m stub connecting roads the divergence synthesis emits
+  # with a direct link between their neighbours. In Vissim a 1 cm link is
+  # below the 0.5 m minimum spline spacing and traffic through it is
+  # unreliable; the stub is 1 cm long, so joining its neighbours directly
+  # changes the geometry by at most that centimetre.
+  absorb_degenerate_stubs: true
+
   # Turn junctions that carry no crossing movement into ordinary road links.
   # Vissim places a node — with the whole intersection machinery, including
   # auto-generated conflict areas — at every <junction>, so the divergence
