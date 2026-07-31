@@ -136,6 +136,36 @@ Legend: ✅ satisfied ｜ ⚠ partial / needs verification ｜ ❌ not satisfied
   0.25 m at a genuine widening/narrowing — Vissim then inserts one
   connector there, which is the intended behavior.
 
+### Severe — non-intersections arriving as intersections (fixed)
+
+Vissim creates **one node per `<junction>`**, and a node brings the whole
+intersection machinery with it: auto-generated conflict areas, priority
+rules, reduced-speed areas. The divergence synthesis wraps *every*
+lane-level merge and diverge in a junction, so a plain widening, an
+off-ramp or a lane drop arrives in Vissim as an intersection. On the
+Odaiba clip only **one of seven junctions is a real intersection**:
+
+| junction | approaches | crossing movements | what it really is |
+|---|---|---|---|
+| 1000 | 4 | 11 pairs | real intersection |
+| 1001, 1002, 1003, 1004 | 1 each | none | diverge / widening |
+| 11000, 11001 | 2 each | none | merge / diverge (the 0.01 m stubs) |
+
+`vissim.dissolve_non_intersection_junctions` (default on) dissolves the
+six non-intersections: their connecting roads become ordinary roads
+(`junction="-1"`) and each neighbouring road is repointed at the branch
+carrying the most lane links. Secondary branches keep their own
+`predecessor`/`successor`, and since Vissim generates connectors from
+`link::predecessor`/`link::successor` the movement survives even though
+OpenDRIVE lets the neighbour name only one of them.
+
+A junction counts as an intersection when it has ≥ 3 distinct approaches
+*or* two of its movements cross geometrically. Road and lane ids are never
+changed, so the `*.mapping.json` sidecar stays valid; the dissolved
+connecting roads are recorded in it as `dissolved_junction_roads` so the
+junction-lanelet validation knows a `turn_direction` lanelet outside a
+junction is intended here (the same role `skipped_synthetic_roads` plays).
+
 ### Known, not fixable at write time
 
 - **Conflict-area priority warnings** (`The priority of conflict area "N"
@@ -218,6 +248,7 @@ is untouched. Settings (see `conf/target/vissim.yaml`):
 | `vissim.local_geo_reference` | `true` | replace the header proj-string with the exact local-frame tmerc string |
 | `vissim.constant_lane_widths` | `true` | collapse each lane's `<width>` chain to a single constant record (arc-length-weighted mean) — prevents Vissim's per-variation connector/1.1 m-link insertion from fragmenting the network |
 | `vissim.merge_overlapping_junctions` | `true` | merge junctions whose connecting roads terminate at the same road endpoint into one junction — Vissim builds one node per junction, and co-located junctions produce "Nodes … overlap on link …" errors with undetermined conflict areas |
+| `vissim.dissolve_non_intersection_junctions` | `true` | turn junctions that carry no crossing movement (pure merges and diverges) into ordinary road links, so Vissim does not place a node — and therefore no intersection — where the road merely widens or forks. Odaiba: 7 junctions → the 1 real intersection |
 
 The pass logs a **Vissim import report**: counts of roads shorter than
 1.1 m / 0.5 m, lanes whose width falls below 1.0 m, and lanes whose

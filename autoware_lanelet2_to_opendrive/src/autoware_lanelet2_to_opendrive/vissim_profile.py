@@ -91,6 +91,12 @@ class VissimConfig:
             polynomial records makes its importer insert a connector and
             two 1.1 m links at every ≥ 0.25 m variation, fragmenting the
             network and causing node-overlap errors.
+        dissolve_non_intersection_junctions: Turn junctions that carry no
+            crossing movement (pure merges and diverges) into ordinary road
+            links. Vissim places a node — with the full intersection
+            machinery — at every junction, so a plain widening or off-ramp
+            otherwise arrives as an intersection. Applied in the conversion
+            pipeline by ``vissim_topology``, before the mapping is written.
         merge_overlapping_junctions: Merge junctions whose connecting roads
             attach to the same road endpoint. The divergence synthesis can
             emit chained junctions that meet at one physical point (two
@@ -107,6 +113,7 @@ class VissimConfig:
     local_geo_reference_proj: Optional[str] = None
     constant_lane_widths: bool = True
     merge_overlapping_junctions: bool = True
+    dissolve_non_intersection_junctions: bool = True
 
     def __post_init__(self) -> None:
         if self.param_poly3_p_range not in _P_RANGE_MODES:

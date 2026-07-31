@@ -2583,16 +2583,31 @@ class _Lanelet2ToOpenDRIVEConverter:
             final_roads.extend(parking_roads)
             print(f"Built {len(parking_roads)} parking roads")
 
-        # Step 6.95: Vissim topology diagnostics. Read-only — it reports the
-        # constructs Vissim degrades on (connectors running along a through
-        # road, connectors below its minimum spline spacing) so they can be
-        # reviewed in Vissim. Gated on the Vissim export profile.
+        # Step 6.95: Vissim topology pass. Dissolves merge/diverge junctions
+        # (Vissim would place a node — a full intersection — at each one),
+        # then reports the constructs it still degrades on. Runs before the
+        # mapping sidecar is written; road and lane ids are never changed.
+        # Gated on the Vissim export profile.
         if self.config.vissim.enabled:
             from autoware_lanelet2_to_opendrive.vissim_topology import (
                 analyze_topology,
+                dissolve_non_intersection_junctions,
             )
 
-            print("\n=== Vissim topology diagnostics ===")
+            print("\n=== Vissim topology pass ===")
+            if self.config.vissim.dissolve_non_intersection_junctions:
+                dissolve_report = dissolve_non_intersection_junctions(
+                    final_roads, junctions
+                )
+                dissolve_report.log(logger)
+                # Recorded in the mapping sidecar so the junction-lanelet
+                # validation knows these roads are outside a junction by
+                # design (same role as skipped_synthetic_roads).
+                mapping.dissolved_junction_roads = sorted(
+                    road_id
+                    for dissolved in dissolve_report.dissolved_junctions
+                    for road_id in dissolved.connecting_roads
+                )
             analyze_topology(final_roads, junctions).log(logger)
 
         # Step 7: Write OpenDRIVE output
@@ -2937,6 +2952,11 @@ def preprocess_and_convert_with_hydra(
             if vissim_dict
             else True
         ),
+        dissolve_non_intersection_junctions=(
+            vissim_dict.get("dissolve_non_intersection_junctions", True)
+            if vissim_dict
+            else True
+        ),
     )
     if vissim_config.enabled and vissim_config.local_geo_reference:
         # The local-frame PROJ string needs the resolved MGRS grid and the
@@ -3039,6 +3059,7 @@ def preprocess_and_convert_with_hydra(
             ),
             lanelet_to_emitted_segments=mapping.lanelet_to_emitted_segments,
             junction_emission_plans=mapping.junction_emission_plans,
+            dissolved_junction_roads=mapping.dissolved_junction_roads,
         )
 
         # Save preprocessed OSM next to XODR so that standalone `analyze`

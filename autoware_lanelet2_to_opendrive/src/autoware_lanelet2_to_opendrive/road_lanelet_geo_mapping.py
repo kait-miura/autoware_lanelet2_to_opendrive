@@ -173,6 +173,12 @@ class GeoRoadLaneletMapping:
     #: they have no source lanelet. Recorded so consumers can tell them
     #: apart from genuine mapping failures (#493).
     skipped_synthetic_roads: list[int] | None = None
+    #: Connecting-road IDs whose junction the Vissim export profile dissolved
+    #: because it carried no crossing movement (a merge or a diverge, not an
+    #: intersection). Their ``junction`` attribute is ``-1`` by design, so a
+    #: ``turn_direction`` lanelet mapped there is not a defect — recorded for
+    #: the same reason as ``skipped_synthetic_roads``.
+    dissolved_junction_roads: list[int] | None = None
     traffic_light_config: dict | None = None
     projection_metadata: ProjectionMetadata | None = None
     lanelet_to_emitted_segments: dict[int, list[dict]] | None = None
@@ -216,6 +222,8 @@ class GeoRoadLaneletMapping:
             }
         if self.skipped_synthetic_roads is not None:
             result["skipped_synthetic_roads"] = list(self.skipped_synthetic_roads)
+        if self.dissolved_junction_roads is not None:
+            result["dissolved_junction_roads"] = list(self.dissolved_junction_roads)
         if self.preprocessing_log is not None:
             result["preprocessing_log"] = self.preprocessing_log
         if self.traffic_light_config is not None:
@@ -266,6 +274,7 @@ class GeoRoadLaneletMapping:
             stop_line_mapping=stop_line_mapping,
             skipped_stop_lines=skipped_stop_lines,
             skipped_synthetic_roads=data.get("skipped_synthetic_roads"),
+            dissolved_junction_roads=data.get("dissolved_junction_roads"),
             traffic_light_config=data.get("traffic_light_config"),
             projection_metadata=projection_metadata,
             lanelet_to_emitted_segments=(
@@ -1784,6 +1793,7 @@ def validate_and_save_mapping(
     projection_metadata: ProjectionMetadata | None = None,
     lanelet_to_emitted_segments: dict[int, list[dict]] | None = None,
     junction_emission_plans: list[dict] | None = None,
+    dissolved_junction_roads: list[int] | None = None,
 ) -> Path:
     """Save mapping JSON and cross-validate against geometric mapping.
 
@@ -1843,6 +1853,9 @@ def validate_and_save_mapping(
         stop_line_mapping=stop_line_mapping,
         skipped_stop_lines=skipped_stop_lines,
         skipped_synthetic_roads=sorted(_synthetic_connector_road_ids(roads)) or None,
+        dissolved_junction_roads=(
+            sorted(dissolved_junction_roads) if dissolved_junction_roads else None
+        ),
         traffic_light_config=traffic_light_config,
         projection_metadata=projection_metadata,
         lanelet_to_emitted_segments=lanelet_to_emitted_segments,

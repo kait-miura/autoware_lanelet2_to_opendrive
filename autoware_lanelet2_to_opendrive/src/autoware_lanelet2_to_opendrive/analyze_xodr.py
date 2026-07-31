@@ -1122,6 +1122,11 @@ def run_junction_lanelet_validation(
     errors: list[str] = []
     ok_count = 0
     unmapped_count = 0
+    dissolved_count = 0
+    # The Vissim export profile deliberately dissolves junctions that carry
+    # no crossing movement, so a turn_direction lanelet on one of those roads
+    # is expected rather than a mapping defect.
+    dissolved_roads = set(ctx.conv_mapping.dissolved_junction_roads or ())
 
     for lanelet_id, turn_dir in sorted(turn_direction_lanelets):
         mapping_entry = ctx.conv_mapping.lanelet_to_road_and_lane.get(lanelet_id)
@@ -1134,6 +1139,8 @@ def run_junction_lanelet_validation(
 
         if junction_id >= 0:
             ok_count += 1
+        elif road_id in dissolved_roads:
+            dissolved_count += 1
         else:
             errors.append(
                 f"  lanelet {lanelet_id} (turn_direction={turn_dir}): "
@@ -1144,6 +1151,11 @@ def run_junction_lanelet_validation(
     print(f"\n  Lanelets with turn_direction: {len(turn_direction_lanelets)}")
     print(f"  Mapped to junction road    : {ok_count}")
     print(f"  NOT in junction (error)    : {len(errors)}")
+    if dissolved_count > 0:
+        print(
+            f"  Junction dissolved (Vissim): {dissolved_count} "
+            "(merge/diverge, no crossing movement)"
+        )
     if unmapped_count > 0:
         print(f"  Not in mapping (skipped)   : {unmapped_count}")
 

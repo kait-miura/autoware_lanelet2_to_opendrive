@@ -34,6 +34,7 @@ from autoware_lanelet2_to_opendrive.opendrive.road_links import (
 from autoware_lanelet2_to_opendrive.vissim_topology import (
     _same_stream_coverage,
     analyze_topology,
+    dissolve_non_intersection_junctions,
 )
 
 
@@ -350,3 +351,206 @@ def test_report_logs_without_error(caplog):
     with caplog.at_level("INFO"):
         report.log()
     assert "Vissim topology" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# dissolve_non_intersection_junctions
+# ---------------------------------------------------------------------------
+
+
+def _diverge_network():
+    """One approach splitting into a through road and a side road.
+
+    Road 1 continues into road 3 via connector 5 (3 lane links) and turns off
+    into road 4 via connector 6 (1 lane link) — a diverge, not an
+    intersection: only one approach and no crossing movement.
+    """
+    approach = _road(1, x=0.0, y=0.0, hdg=0.0, length=40.0, lane_widths=(3.5, 3.5, 3.5))
+    through = _road(3, x=42.0, y=0.0, hdg=0.0, length=40.0, lane_widths=(3.5, 3.5, 3.5))
+    side = _road(4, x=42.0, y=-20.0, hdg=-0.6, length=40.0)
+    straight = _connector(
+        5,
+        x=40.0,
+        y=0.0,
+        hdg=0.0,
+        length=2.0,
+        junction=900,
+        predecessor=1,
+        successor=3,
+        lane_widths=(3.5, 3.5, 3.5),
+    )
+    turn = _connector(
+        6,
+        x=40.0,
+        y=0.0,
+        hdg=-0.6,
+        length=2.0,
+        junction=900,
+        predecessor=1,
+        successor=4,
+    )
+    junction = Junction(
+        id=900,
+        name="diverge_900",
+        connections=[
+            Connection(
+                id=0,
+                incoming_road=1,
+                connecting_road=5,
+                contact_point=ContactPoint.START,
+                lane_links=[LaneLink(1, 1), LaneLink(2, 2), LaneLink(3, 3)],
+            ),
+            Connection(
+                id=1,
+                incoming_road=1,
+                connecting_road=6,
+                contact_point=ContactPoint.START,
+                lane_links=[LaneLink(1, 1)],
+            ),
+        ],
+    )
+    approach.link = RoadLink(
+        successor=Successor(ElementType.JUNCTION, 900, None),
+    )
+    through.link = RoadLink(
+        predecessor=Predecessor(ElementType.JUNCTION, 900, None),
+    )
+    side.link = RoadLink(
+        predecessor=Predecessor(ElementType.JUNCTION, 900, None),
+    )
+    return [approach, through, side, straight, turn], [junction]
+
+
+def test_diverge_junction_is_dissolved():
+    roads, junctions = _diverge_network()
+    report = dissolve_non_intersection_junctions(roads, junctions)
+
+    assert junctions == []
+    assert [d.junction_id for d in report.dissolved_junctions] == [900]
+    assert report.dissolved_junctions[0].connecting_roads == [5, 6]
+    assert report.kept_junctions == []
+
+    by_id = {road.id: road for road in roads}
+    # Both former connecting roads are ordinary roads now.
+    assert by_id[5].junction == -1
+    assert by_id[6].junction == -1
+    # The neighbours name the branch carrying the most lane links (road 5).
+    assert by_id[1].link.successor.element_type == ElementType.ROAD
+    assert by_id[1].link.successor.element_id == 5
+    assert by_id[1].link.successor.contact_point == ContactPoint.START
+    assert by_id[3].link.predecessor.element_id == 5
+    assert by_id[3].link.predecessor.contact_point == ContactPoint.END
+    # The side road is fed by the only connector that reaches it.
+    assert by_id[4].link.predecessor.element_id == 6
+    # The secondary branch keeps its own links, so the movement survives.
+    assert by_id[6].link.predecessor.element_id == 1
+    assert by_id[6].link.successor.element_id == 4
+
+
+def test_real_intersection_is_kept():
+    """Four approaches: an intersection even without detected crossings."""
+    roads, junctions = _diverge_network()
+    junction = junctions[0]
+    junction.connections.append(
+        Connection(
+            id=2,
+            incoming_road=7,
+            connecting_road=5,
+            contact_point=ContactPoint.START,
+            lane_links=[LaneLink(1, 1)],
+        )
+    )
+    junction.connections.append(
+        Connection(
+            id=3,
+            incoming_road=8,
+            connecting_road=6,
+            contact_point=ContactPoint.START,
+            lane_links=[LaneLink(1, 1)],
+        )
+    )
+    report = dissolve_non_intersection_junctions(roads, junctions)
+
+    assert [j.id for j in junctions] == [900]
+    assert report.dissolved_junctions == []
+    assert report.kept_junctions[0][0] == 900
+    assert report.kept_junctions[0][1] == 3  # distinct approaches
+    assert roads[3].junction == 900
+
+
+def test_crossing_movements_keep_a_two_arm_junction():
+    """Two approaches whose paths cross is still an intersection."""
+    west = _road(1, x=0.0, y=0.0, hdg=0.0, length=20.0)
+    south = _road(2, x=25.0, y=-25.0, hdg=math.pi / 2, length=20.0)
+    east = _road(3, x=50.0, y=0.0, hdg=0.0, length=20.0)
+    north = _road(4, x=25.0, y=25.0, hdg=math.pi / 2, length=20.0)
+    # Straight west->east and straight south->north cross in the middle.
+    across = _connector(
+        5,
+        x=20.0,
+        y=0.0,
+        hdg=0.0,
+        length=30.0,
+        junction=900,
+        predecessor=1,
+        successor=3,
+    )
+    up = _connector(
+        6,
+        x=25.0,
+        y=-5.0,
+        hdg=math.pi / 2,
+        length=30.0,
+        junction=900,
+        predecessor=2,
+        successor=4,
+    )
+    junction = Junction(
+        id=900,
+        name="cross_900",
+        connections=[
+            Connection(
+                id=0,
+                incoming_road=1,
+                connecting_road=5,
+                contact_point=ContactPoint.START,
+                lane_links=[LaneLink(1, 1)],
+            ),
+            Connection(
+                id=1,
+                incoming_road=2,
+                connecting_road=6,
+                contact_point=ContactPoint.START,
+                lane_links=[LaneLink(1, 1)],
+            ),
+        ],
+    )
+    roads = [west, south, east, north, across, up]
+    junctions = [junction]
+
+    report = dissolve_non_intersection_junctions(roads, junctions)
+
+    assert [j.id for j in junctions] == [900]
+    assert report.dissolved_junctions == []
+    assert report.kept_junctions[0][2] >= 1  # crossing pairs detected
+
+
+def test_dissolve_leaves_road_and_lane_ids_untouched():
+    """The mapping sidecar keys on road/lane ids, so they must not change."""
+    roads, junctions = _diverge_network()
+    before = [
+        (
+            road.id,
+            [lane.lane_id for lane in road.lanes.lane_sections[0].get_all_lanes()],
+        )
+        for road in roads
+    ]
+    dissolve_non_intersection_junctions(roads, junctions)
+    after = [
+        (
+            road.id,
+            [lane.lane_id for lane in road.lanes.lane_sections[0].get_all_lanes()],
+        )
+        for road in roads
+    ]
+    assert before == after

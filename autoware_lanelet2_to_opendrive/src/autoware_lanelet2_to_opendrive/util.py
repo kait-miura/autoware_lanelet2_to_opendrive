@@ -161,12 +161,16 @@ class RoadLaneletMapping:
         lanelet_to_emitted_segments: Optional multi-segment trace produced when
             physical OpenDRIVE road decomposition differs from logical topology.
         junction_emission_plans: Optional JSON-safe planning summaries.
+        dissolved_junction_roads: Connecting-road IDs whose junction the Vissim
+            export profile dissolved (a merge or diverge, not an
+            intersection). Their ``junction`` attribute is ``-1`` by design.
     """
 
     road_to_lanelets: Dict[int, List[int]]
     lanelet_to_road: Dict[int, int]
     lanelet_to_emitted_segments: Optional[Dict[int, List[dict]]] = None
     junction_emission_plans: Optional[List[dict]] = None
+    dissolved_junction_roads: Optional[List[int]] = None
 
     def get_lanelets_for_road(self, road_id: int) -> List[int]:
         """Get all lanelet IDs that belong to a specific road.

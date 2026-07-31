@@ -1,17 +1,34 @@
-"""Vissim-relevant topology diagnostics, run inside the conversion pipeline.
+"""Vissim-targeted topology pass, run inside the conversion pipeline.
 
-Vissim turns every ``<road>`` into a link and every connecting road into a
-connector, then auto-generates a conflict area wherever two of them overlap.
-Because it imports no right-of-way, those conflict areas come up with an
-undetermined priority — and when both sides are really the *same* traffic
-stream, the stretch becomes hard to drive.
+Vissim turns every ``<road>`` into a link, every connecting road into a
+connector, and every ``<junction>`` into a **node** — and a node brings the
+whole intersection machinery with it: auto-generated conflict areas,
+priority rules, reduced-speed areas. Since it imports no right-of-way, those
+conflict areas come up with an undetermined priority and have to be reviewed
+by hand.
 
-Two constructs in the converter's output trigger that:
+:func:`dissolve_non_intersection_junctions` therefore removes the junctions
+that are not intersections. The divergence synthesis wraps *every*
+lane-level merge and diverge in a junction, so a plain widening, an off-ramp
+or a lane drop otherwise arrives in Vissim as an intersection: on the Odaiba
+clip only one of seven junctions has crossing movements. Their connecting
+roads become ordinary roads and each neighbour is repointed at the branch
+carrying the most lane links; secondary branches keep their own
+predecessor/successor, and because Vissim builds connectors from
+``link::predecessor``/``link::successor`` the movement survives even though
+OpenDRIVE lets the neighbour name only one of them. Road and lane ids are
+never touched, so the ``*.mapping.json`` sidecar stays valid.
+
+:func:`analyze_topology` then reports two constructs that are left for
+review because no safe automatic repair exists at this level:
 
 1. A connecting road that runs *along* a through road in the same direction.
-   On the Odaiba clip, connecting road 53 (junction 1001, road 31 → road 9)
-   runs along 48 % of through road 12 — the middle of the southbound-to-
-   northbound three-lane corridor.
+   On the Odaiba clip, connecting road 53 (road 31 → road 9) runs along
+   48 % of through road 12 — the middle of the southbound-to-northbound
+   three-lane corridor. It is only reported: connecting roads that look like
+   duplicates at road level (Odaiba 43, 47 and 50) serve *different
+   destination lanes* of the same outgoing road, so dropping one silently
+   deletes a movement.
 2. A connecting road shorter than Vissim's 0.5 m minimum spline spacing.
    The Odaiba clip has six 0.01 m stubs (roads 34–39), kept because CARLA's
    loader needs them.
@@ -22,13 +39,6 @@ lines alone reports the *oncoming* carriageway of a two-way road as a 100 %
 overlay, because its reference line can run within a metre of ours. That
 artifact is why a naive metric flags connectors which merely pass the other
 side of the road.
-
-This module only measures and reports — it never edits the network. Removing
-an overlapping connector is not safe at this level: several connecting roads
-that look like duplicates of each other at road level (Odaiba connectors 43,
-47 and 50) serve *different destination lanes* of the same outgoing road, so
-dropping one silently deletes a movement. Fixing these constructs properly
-belongs in the junction/divergence geometry generation.
 """
 
 import logging
@@ -37,15 +47,21 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Set, Tuple
 
-from .opendrive.enums import ElementType
+from .opendrive.enums import ContactPoint, ElementType
 from .opendrive.junction import Junction
 from .opendrive.road import Road
+from .opendrive.road_links import Predecessor, Successor
 
 logger = logging.getLogger(__name__)
 
 #: Fraction of a through road that must be covered by a connecting road
 #: before the connector counts as running along that road.
 DEFAULT_MIN_LINK_COVERAGE = 0.4
+
+#: A junction with at least this many distinct incoming roads is treated as a
+#: real intersection even when no two of its movements cross (an approach
+#: whose turns all leave on different arms still needs the node).
+DEFAULT_MIN_INTERSECTION_ARMS = 3
 
 #: Vissim sets spline points at a minimum spacing of 0.5 m, so a shorter
 #: connecting road cannot be represented as a proper connector.
@@ -89,14 +105,47 @@ class DegenerateConnector:
 
 
 @dataclass
+class DissolvedJunction:
+    """A junction that carried no crossing movement and was dissolved."""
+
+    junction_id: int
+    name: Optional[str]
+    incoming_roads: List[int]
+    connecting_roads: List[int]
+
+
+@dataclass
 class VissimTopologyReport:
     """Constructs in the emitted network that Vissim degrades on."""
 
     overlaps: List[SameStreamOverlap] = field(default_factory=list)
     degenerate_connectors: List[DegenerateConnector] = field(default_factory=list)
+    dissolved_junctions: List[DissolvedJunction] = field(default_factory=list)
+    kept_junctions: List[Tuple[int, int, int]] = field(default_factory=list)
+    """``(junction_id, arm_count, crossing_pairs)`` for real intersections."""
 
     def log(self, log: logging.Logger = logger) -> None:
-        """Report both categories; nothing is modified."""
+        """Report what was dissolved and the constructs left for review."""
+        for junction in self.dissolved_junctions:
+            log.info(
+                "Vissim topology: dissolved junction %d (%s) — %d incoming "
+                "road(s), no crossing movement, so it is a merge/diverge and "
+                "not an intersection; its connecting roads %s became ordinary "
+                "roads so Vissim does not place a node here",
+                junction.junction_id,
+                junction.name or "unnamed",
+                len(junction.incoming_roads),
+                junction.connecting_roads,
+            )
+        if self.kept_junctions:
+            log.info(
+                "Vissim topology: kept %d real intersection(s): %s",
+                len(self.kept_junctions),
+                ", ".join(
+                    f"junction {jid} ({arms} arms, {crossings} crossing pairs)"
+                    for jid, arms, crossings in self.kept_junctions
+                ),
+            )
         if self.overlaps:
             log.warning(
                 "Vissim topology: %d through road(s) have a connector running "
@@ -258,6 +307,47 @@ def _same_stream_coverage(
     return matched / len(ours)
 
 
+def _centre_polyline(road: Road) -> List[Tuple[float, float]]:
+    """Reference-line polyline of a road, for crossing tests."""
+    return [points[0] for points, _ in _band_stations(road)] if road else []
+
+
+def _segments_cross(
+    a1: Tuple[float, float],
+    a2: Tuple[float, float],
+    b1: Tuple[float, float],
+    b2: Tuple[float, float],
+) -> bool:
+    """Do the two open segments properly intersect?"""
+    d1 = (a2[0] - a1[0], a2[1] - a1[1])
+    d2 = (b2[0] - b1[0], b2[1] - b1[1])
+    denominator = d1[0] * d2[1] - d1[1] * d2[0]
+    if abs(denominator) < 1e-12:
+        return False
+    t = ((b1[0] - a1[0]) * d2[1] - (b1[1] - a1[1]) * d2[0]) / denominator
+    u = ((b1[0] - a1[0]) * d1[1] - (b1[1] - a1[1]) * d1[0]) / denominator
+    return 0.05 < t < 0.95 and 0.05 < u < 0.95
+
+
+def _paths_cross(first: Road, second: Road) -> bool:
+    """Do two connecting roads cross each other away from their endpoints?
+
+    Endpoint neighbourhoods are excluded by the segment parameter window, so
+    two branches leaving the same approach side by side do not count.
+    """
+    left = _centre_polyline(first)
+    right = _centre_polyline(second)
+    if len(left) < 2 or len(right) < 2:
+        return False
+    for index in range(len(left) - 1):
+        for other in range(len(right) - 1):
+            if _segments_cross(
+                left[index], left[index + 1], right[other], right[other + 1]
+            ):
+                return True
+    return False
+
+
 def _linked_road_ids(road: Road) -> Set[int]:
     """Road ids this road links to directly (ignoring junction links)."""
     if road.link is None:
@@ -280,6 +370,157 @@ def _endpoints(road: Road) -> Tuple[Optional[int], Optional[int]]:
         return int(end.element_id)
 
     return (road_id(road.link.predecessor), road_id(road.link.successor))
+
+
+def _is_intersection(
+    junction: Junction,
+    by_id: Dict[int, Road],
+    min_arms: int,
+) -> Tuple[bool, int, int]:
+    """Classify a junction; returns ``(is_intersection, arms, crossing_pairs)``.
+
+    A junction is an intersection when traffic streams actually meet: either
+    it has ``min_arms`` or more distinct approaches, or two of its movements
+    cross. A pure merge (several approaches, one exit) or diverge (one
+    approach, several exits) is neither — it is a continuation of a road, and
+    wrapping it in a junction makes Vissim place a node where there is no
+    intersection.
+    """
+    arms = {int(connection.incoming_road) for connection in junction.connections}
+    crossings = 0
+    connections = junction.connections
+    for index, first in enumerate(connections):
+        for second in connections[index + 1 :]:
+            if int(first.incoming_road) == int(second.incoming_road):
+                continue
+            left = by_id.get(int(first.connecting_road))
+            right = by_id.get(int(second.connecting_road))
+            if left is None or right is None or left is right:
+                continue
+            if _paths_cross(left, right):
+                crossings += 1
+    return (len(arms) >= min_arms or crossings > 0, len(arms), crossings)
+
+
+def dissolve_non_intersection_junctions(
+    roads: Sequence[Road],
+    junctions: List[Junction],
+    *,
+    min_arms: int = DEFAULT_MIN_INTERSECTION_ARMS,
+) -> VissimTopologyReport:
+    """Turn merge/diverge junctions into ordinary road links.
+
+    Vissim creates one node per ``<junction>``, and a node brings the whole
+    intersection machinery with it — conflict areas, priority rules, reduced
+    speed areas. The divergence synthesis wraps every lane-level merge and
+    diverge in a junction, so a plain widening or an off-ramp arrives in
+    Vissim as an intersection. On the Odaiba clip only one of six junctions
+    is a real intersection.
+
+    For each junction with no crossing movement and fewer than ``min_arms``
+    approaches, its connecting roads become ordinary roads (``junction=-1``)
+    and every road that pointed at the junction is repointed at the
+    connecting road that continues it — the branch carrying the most lane
+    links. Secondary branches keep their own predecessor/successor links, so
+    Vissim still builds a connector for them: it generates connectors from
+    ``link::predecessor``/``link::successor``, which is why the movement
+    survives even though OpenDRIVE lets the neighbouring road name only one
+    of them.
+
+    Road and lane ids are untouched, so the ``*.mapping.json`` sidecar stays
+    valid.
+
+    Args:
+        roads: All roads about to be emitted.
+        junctions: All junctions about to be emitted (mutated in place).
+        min_arms: Distinct approaches at which a junction counts as an
+            intersection regardless of crossings.
+
+    Returns:
+        A :class:`VissimTopologyReport` recording dissolved and kept
+        junctions.
+    """
+    report = VissimTopologyReport()
+    by_id = {road.id: road for road in roads}
+    survivors: List[Junction] = []
+
+    for junction in junctions:
+        intersection, arms, crossings = _is_intersection(junction, by_id, min_arms)
+        if intersection:
+            survivors.append(junction)
+            report.kept_junctions.append((junction.id, arms, crossings))
+            continue
+
+        connecting_ids = [
+            int(connection.connecting_road) for connection in junction.connections
+        ]
+        # Lane-link count per connecting road decides which branch a
+        # neighbouring road should name as its predecessor/successor.
+        weight = {
+            int(connection.connecting_road): len(connection.lane_links)
+            for connection in junction.connections
+        }
+
+        for connecting_id in connecting_ids:
+            connector = by_id.get(connecting_id)
+            if connector is not None:
+                connector.junction = -1
+
+        for road in roads:
+            if road.link is None:
+                continue
+            for side, opposite in (
+                ("predecessor", "successor"),
+                ("successor", "predecessor"),
+            ):
+                end = getattr(road.link, side)
+                if (
+                    end is None
+                    or end.element_type != ElementType.JUNCTION
+                    or int(end.element_id) != junction.id
+                ):
+                    continue
+                # Candidates: connecting roads of this junction that name this
+                # road on the matching side.
+                candidates = []
+                for connecting_id in connecting_ids:
+                    connector = by_id.get(connecting_id)
+                    if connector is None or connector.link is None:
+                        continue
+                    far = getattr(connector.link, opposite)
+                    if (
+                        far is not None
+                        and far.element_type == ElementType.ROAD
+                        and int(far.element_id) == road.id
+                    ):
+                        candidates.append(connecting_id)
+                if not candidates:
+                    setattr(road.link, side, None)
+                    continue
+                primary = max(candidates, key=lambda rid: (weight.get(rid, 0), -rid))
+                contact = (
+                    ContactPoint.END if side == "predecessor" else ContactPoint.START
+                )
+                if side == "predecessor":
+                    road.link.predecessor = Predecessor(
+                        ElementType.ROAD, primary, contact
+                    )
+                else:
+                    road.link.successor = Successor(ElementType.ROAD, primary, contact)
+
+        report.dissolved_junctions.append(
+            DissolvedJunction(
+                junction_id=junction.id,
+                name=junction.name,
+                incoming_roads=sorted(
+                    {int(c.incoming_road) for c in junction.connections}
+                ),
+                connecting_roads=sorted(connecting_ids),
+            )
+        )
+
+    junctions[:] = survivors
+    return report
 
 
 def analyze_topology(

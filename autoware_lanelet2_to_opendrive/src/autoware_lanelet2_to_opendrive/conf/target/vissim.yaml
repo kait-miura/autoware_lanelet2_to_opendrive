@@ -69,3 +69,11 @@ vissim:
   # node per junction; co-located junctions make the node areas overlap
   # ("Nodes ... overlap on link ..." error, conflict areas undetermined).
   merge_overlapping_junctions: true
+
+  # Turn junctions that carry no crossing movement into ordinary road links.
+  # Vissim places a node — with the whole intersection machinery, including
+  # auto-generated conflict areas — at every <junction>, so the divergence
+  # synthesis wrapping each lane-level merge/diverge in a junction makes
+  # plain widenings and off-ramps arrive as intersections. On the Odaiba
+  # clip this reduces 7 junctions to the 1 real intersection.
+  dissolve_non_intersection_junctions: true
