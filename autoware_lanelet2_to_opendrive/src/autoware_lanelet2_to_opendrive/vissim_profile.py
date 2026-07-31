@@ -91,6 +91,13 @@ class VissimConfig:
             polynomial records makes its importer insert a connector and
             two 1.1 m links at every ≥ 0.25 m variation, fragmenting the
             network and causing node-overlap errors.
+        merge_overlapping_junctions: Merge junctions whose connecting roads
+            attach to the same road endpoint. The divergence synthesis can
+            emit chained junctions that meet at one physical point (two
+            connecting roads from different junctions ending at the same
+            road start); Vissim builds one node per junction and reports
+            "Nodes … overlap on link …/link segments … are invalid" for
+            such pairs, leaving conflict areas undetermined.
     """
 
     enabled: bool = False
@@ -99,6 +106,7 @@ class VissimConfig:
     local_geo_reference: bool = True
     local_geo_reference_proj: Optional[str] = None
     constant_lane_widths: bool = True
+    merge_overlapping_junctions: bool = True
 
     def __post_init__(self) -> None:
         if self.param_poly3_p_range not in _P_RANGE_MODES:
@@ -116,6 +124,7 @@ class VissimProfileReport:
     param_poly3_reparameterized: int = 0
     geo_reference_replaced: bool = False
     lanes_width_constantized: int = 0
+    junctions_merged: int = 0
     roads_below_spline_spacing: List[str] = field(default_factory=list)
     roads_below_inserted_link_length: List[str] = field(default_factory=list)
     lanes_below_min_width: int = 0
@@ -127,11 +136,12 @@ class VissimProfileReport:
         log.info(
             "Vissim profile: stripped %d rule attributes, "
             "re-parameterized %d paramPoly3 segments, geoReference %s, "
-            "constantized widths on %d lanes",
+            "constantized widths on %d lanes, merged %d co-located junctions",
             self.rule_attributes_stripped,
             self.param_poly3_reparameterized,
             "replaced" if self.geo_reference_replaced else "kept",
             self.lanes_width_constantized,
+            self.junctions_merged,
         )
         if self.roads_below_spline_spacing:
             log.warning(
@@ -361,6 +371,91 @@ def _constantize_lane_widths(root: ET._Element) -> int:
     return constantized
 
 
+def _merge_overlapping_junctions(root: ET._Element) -> int:
+    """Merge junctions whose connecting roads share a road attachment point.
+
+    The divergence synthesis can emit two junctions whose connecting roads
+    terminate at the *same* road endpoint (e.g. two merge branches ending
+    at one road start). Vissim builds one node per ``<junction>`` and both
+    node areas then cover the shared endpoint, producing "Nodes … overlap
+    on link …" errors and undetermined conflict areas. Merging the
+    junctions yields a single node, which cannot overlap itself.
+
+    Returns the number of junctions dissolved into another one.
+    """
+    roads = {r.get("id"): r for r in root.iter("road")}
+    junction_elems = {j.get("id"): j for j in root.findall("junction")}
+
+    # Attachment point -> junctions touching it, via the road-level links
+    # of each junction's connecting roads.
+    attachments: dict = {}
+    for jid, junction in junction_elems.items():
+        for connection in junction.findall("connection"):
+            connecting = roads.get(connection.get("connectingRoad"))
+            if connecting is None:
+                continue
+            link = connecting.find("link")
+            if link is None:
+                continue
+            for tag in ("predecessor", "successor"):
+                e = link.find(tag)
+                if e is not None and e.get("elementType") == "road":
+                    key = (e.get("elementId"), e.get("contactPoint"))
+                    attachments.setdefault(key, set()).add(jid)
+
+    # Union-find over junctions sharing any attachment point.
+    parent = {jid: jid for jid in junction_elems}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for ids in attachments.values():
+        ids = sorted(ids)
+        for other in ids[1:]:
+            ra, rb = find(ids[0]), find(other)
+            if ra != rb:
+                parent[rb] = ra
+
+    groups: dict = {}
+    for jid in junction_elems:
+        groups.setdefault(find(jid), []).append(jid)
+
+    merged = 0
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        # Deterministic primary: numerically smallest id when possible.
+        group.sort(key=lambda s: (int(s) if s.isdigit() else 1 << 62, s))
+        primary_id, rest = group[0], group[1:]
+        primary = junction_elems[primary_id]
+        for jid in rest:
+            junction = junction_elems[jid]
+            # Move connections / priority records into the primary junction.
+            for child in list(junction):
+                junction.remove(child)
+                primary.append(child)
+            # Rewrite references: connecting roads' junction attribute and
+            # every road-level link that names the dissolved junction.
+            for road in roads.values():
+                if road.get("junction") == jid:
+                    road.set("junction", primary_id)
+                link = road.find("link")
+                if link is None:
+                    continue
+                for e in link:
+                    if e.get("elementType") == "junction" and e.get("elementId") == jid:
+                        e.set("elementId", primary_id)
+            root.remove(junction)
+            merged += 1
+        # Connection ids must stay unique within the merged junction.
+        for index, connection in enumerate(primary.findall("connection")):
+            connection.set("id", str(index))
+    return merged
+
+
 def _width_samples(width_elems: List[ET._Element], road_length: float) -> List[float]:
     """Sample each width polynomial at the start/middle/end of its domain."""
     samples: List[float] = []
@@ -443,6 +538,9 @@ def apply_vissim_profile(
 
     if config.constant_lane_widths:
         report.lanes_width_constantized = _constantize_lane_widths(root)
+
+    if config.merge_overlapping_junctions:
+        report.junctions_merged = _merge_overlapping_junctions(root)
 
     # Indicators are collected after all edits so they describe the file
     # Vissim will actually see.

@@ -108,6 +108,21 @@ Legend: ✅ satisfied ｜ ⚠ partial / needs verification ｜ ❌ not satisfied
   profile with road IDs. Divergence stubs are required by the CARLA
   loader fix (#291 series), so they are kept; a Vissim-specific stub
   consolidation pass is future work.
+- **Co-located junctions → Vissim node overlap** (confirmed on a real
+  Vissim import). Vissim creates one node per `<junction>`. The
+  divergence synthesis can chain two junctions whose connecting roads
+  terminate at the *same* road endpoint — on the Odaiba clip, junction
+  1001 (connecting road 53) and junction 1002 (connecting road 59) both
+  end at the start of road 9, only 3.1 m apart. Both node areas then
+  cover that point and Vissim reports `Nodes "1002" and "1001" overlap
+  on link "9: Road_9-0-Left" at position 0.4 m … the status of the
+  conflict areas can therefore not be determined`. Fixed by
+  `vissim.merge_overlapping_junctions` (default on): junctions sharing an
+  attachment point are merged into one (connections moved, connection ids
+  renumbered, `road@junction` and every road-level junction link
+  rewritten), so one node replaces the overlapping pair. Lanelet2
+  topology and all movements are preserved — only the junction grouping
+  changes.
 - **Polynomial width records** (confirmed on a real Vissim import):
   with dense polynomial `<width>` chains, Vissim's width-change
   machinery (connector + 2 × 1.1 m links per ≥ 0.25 m variation)
@@ -150,6 +165,7 @@ is untouched. Settings (see `conf/target/vissim.yaml`):
 | `vissim.param_poly3_p_range` | `normalized` | `normalized`: exact re-parameterization to `p ∈ [0,1]`, `pRange` attribute removed (schema-clean). `arcLength`: keep coefficients and attribute |
 | `vissim.local_geo_reference` | `true` | replace the header proj-string with the exact local-frame tmerc string |
 | `vissim.constant_lane_widths` | `true` | collapse each lane's `<width>` chain to a single constant record (arc-length-weighted mean) — prevents Vissim's per-variation connector/1.1 m-link insertion from fragmenting the network |
+| `vissim.merge_overlapping_junctions` | `true` | merge junctions whose connecting roads terminate at the same road endpoint into one junction — Vissim builds one node per junction, and co-located junctions produce "Nodes … overlap on link …" errors with undetermined conflict areas |
 
 The pass logs a **Vissim import report**: counts of roads shorter than
 1.1 m / 0.5 m, lanes whose width falls below 1.0 m, and lanes whose
@@ -181,13 +197,17 @@ correct. The polynomial-width fragmentation this import exposed is fixed by
    travel direction for positive-index lanes (LHT Japanese maps).
 3. ~~paramPoly3 support~~ — appears supported (curved links imported).
 4. ~~Background-map placement~~ — appears correct; re-confirm visually.
-5. Re-import after the constant-width fix and check that the
+5. Re-import after the constant-width and junction-merge fixes: the
    "Nodes … overlap on link …" error and the dense generated-connector
-   webs are gone. If node overlaps persist around the small twin
-   junctions (1001/1002-style, ~1.8 m connecting roads), plan the
-   junction/stub consolidation pass.
+   webs should be gone, and conflict areas should now be determinable.
 6. Review roads listed in the import report (< 0.5 m) inside Vissim; if
    they degenerate, plan the stub-consolidation pass.
+7. Vissim renders one constant width per link, so lane edges step at road
+   boundaries (median 0.10 m, 63 of 83 joints below Vissim's 0.25 m
+   threshold and therefore absorbed by its own width harmonization). If a
+   smoother appearance is wanted in generic OpenDRIVE viewers, a
+   chain-level width harmonization (one width per connected lane chain
+   below the 0.25 m threshold) is the next step.
 
 ---
 

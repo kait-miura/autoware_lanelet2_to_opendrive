@@ -274,6 +274,98 @@ def test_constant_lane_widths_keeps_already_constant_record():
     assert float(root.find(".//lane[@id='1']/width").get("a")) == 3.5
 
 
+def _twin_junction_tree() -> ET._Element:
+    """Two junctions whose connecting roads both end at road 9's start."""
+    xml = """
+    <OpenDRIVE>
+      <header revMajor="1" revMinor="4"/>
+      <road id="31" length="75.0" junction="-1">
+        <planView><geometry s="0" x="0" y="0" hdg="0" length="75.0"><line/></geometry></planView>
+        <link><successor elementType="junction" elementId="1001"/></link>
+        <lanes><laneSection s="0.0"><center><lane id="0" type="none" level="false"/></center></laneSection></lanes>
+      </road>
+      <road id="53" length="29.0" junction="1001">
+        <planView><geometry s="0" x="0" y="0" hdg="0" length="29.0"><line/></geometry></planView>
+        <link>
+          <predecessor elementType="road" elementId="31" contactPoint="end"/>
+          <successor elementType="road" elementId="9" contactPoint="start"/>
+        </link>
+        <lanes><laneSection s="0.0"><center><lane id="0" type="none" level="false"/></center></laneSection></lanes>
+      </road>
+      <road id="59" length="1.8" junction="1002">
+        <planView><geometry s="0" x="0" y="0" hdg="0" length="1.8"><line/></geometry></planView>
+        <link>
+          <predecessor elementType="road" elementId="12" contactPoint="end"/>
+          <successor elementType="road" elementId="9" contactPoint="start"/>
+        </link>
+        <lanes><laneSection s="0.0"><center><lane id="0" type="none" level="false"/></center></laneSection></lanes>
+      </road>
+      <road id="12" length="25.0" junction="-1">
+        <planView><geometry s="0" x="0" y="0" hdg="0" length="25.0"><line/></geometry></planView>
+        <link>
+          <predecessor elementType="junction" elementId="1001"/>
+          <successor elementType="junction" elementId="1002"/>
+        </link>
+        <lanes><laneSection s="0.0"><center><lane id="0" type="none" level="false"/></center></laneSection></lanes>
+      </road>
+      <road id="9" length="86.0" junction="-1">
+        <planView><geometry s="0" x="0" y="0" hdg="0" length="86.0"><line/></geometry></planView>
+        <link><predecessor elementType="junction" elementId="1002"/></link>
+        <lanes><laneSection s="0.0"><center><lane id="0" type="none" level="false"/></center></laneSection></lanes>
+      </road>
+      <junction id="1001" name="junction_a">
+        <connection id="0" incomingRoad="31" connectingRoad="53" contactPoint="start">
+          <laneLink from="1" to="1"/>
+        </connection>
+      </junction>
+      <junction id="1002" name="junction_b">
+        <connection id="0" incomingRoad="12" connectingRoad="59" contactPoint="start">
+          <laneLink from="1" to="1"/>
+        </connection>
+      </junction>
+      <junction id="1003" name="junction_far">
+        <connection id="0" incomingRoad="9" connectingRoad="31" contactPoint="start"/>
+      </junction>
+    </OpenDRIVE>
+    """
+    return ET.fromstring(xml.encode())
+
+
+def test_merge_overlapping_junctions_dissolves_colocated_pair():
+    root = _twin_junction_tree()
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+    assert report.junctions_merged == 1
+
+    junctions = root.findall("junction")
+    ids = {j.get("id") for j in junctions}
+    # 1002 dissolved into 1001; unrelated 1003 untouched.
+    assert ids == {"1001", "1003"}
+
+    merged = next(j for j in junctions if j.get("id") == "1001")
+    conns = merged.findall("connection")
+    assert len(conns) == 2
+    # Connection ids renumbered uniquely.
+    assert sorted(c.get("id") for c in conns) == ["0", "1"]
+    assert {c.get("connectingRoad") for c in conns} == {"53", "59"}
+
+    # References rewritten: connecting road 59 and every junction link.
+    road_59 = root.find("road[@id='59']")
+    assert road_59.get("junction") == "1001"
+    road_9 = root.find("road[@id='9']")
+    assert road_9.find("link/predecessor").get("elementId") == "1001"
+    road_12 = root.find("road[@id='12']")
+    assert road_12.find("link/successor").get("elementId") == "1001"
+
+
+def test_merge_overlapping_junctions_can_be_disabled():
+    root = _twin_junction_tree()
+    report = apply_vissim_profile(
+        root, VissimConfig(enabled=True, merge_overlapping_junctions=False)
+    )
+    assert report.junctions_merged == 0
+    assert len(root.findall("junction")) == 3
+
+
 def test_constant_lane_widths_can_be_disabled():
     root = _lane_with_widths(
         '<width sOffset="0.0" a="2.0" b="0.25" c="0.0" d="0.0"/>'
