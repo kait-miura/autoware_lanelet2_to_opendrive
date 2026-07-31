@@ -626,19 +626,36 @@ def _lane_centre(root, road_id, lane_id, at_end):
     return None
 
 
-def test_connector_is_slid_onto_the_lane_it_links():
+def test_connector_is_slid_towards_the_lane_it_links():
+    """A rigid move closes the joint without deforming the connector.
+
+    It takes the mean of the errors at the two ends, so it cannot zero both;
+    what it must not do is pull the geometry apart or leave a ``length``
+    attribute describing a curve that no longer exists, which an earlier
+    per-segment ramp did.
+    """
     root = _junction_tree()
+    before = math.dist(
+        _lane_centre(root, "2", 1, at_end=False),
+        _lane_centre(root, "1", 2, at_end=True),
+    )
+
     report = apply_vissim_profile(root, VissimConfig(enabled=True))
 
     assert len(report.connectors_realigned) == 1
-    connector_id, start_shift, _ = report.connectors_realigned[0]
+    connector_id, shift, residual = report.connectors_realigned[0]
     assert connector_id == "2"
-    assert abs(start_shift) > 1e-6
+    assert abs(shift) > 1e-6
+    after = math.dist(
+        _lane_centre(root, "2", 1, at_end=False),
+        _lane_centre(root, "1", 2, at_end=True),
+    )
+    assert after < before
+    assert residual >= 0.0
 
-    # The connector's lane centre now meets road 1's lane 2 at the joint.
-    ours = _lane_centre(root, "2", 1, at_end=False)
-    theirs = _lane_centre(root, "1", 2, at_end=True)
-    assert math.dist(ours, theirs) == pytest.approx(0.0, abs=1e-6)
+    # The connector is still a rigid body: its segment lengths are untouched.
+    connector = root.find("road[@id='2']")
+    assert [g.get("length") for g in connector.findall("planView/geometry")] == ["10.0"]
 
 
 def test_alignment_leaves_the_links_untouched():

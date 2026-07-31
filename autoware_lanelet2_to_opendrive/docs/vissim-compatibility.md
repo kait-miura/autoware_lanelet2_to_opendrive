@@ -307,6 +307,49 @@ polygons become adjacent, or start it where it has actually separated.
 - Lane widths < 1 m are clamped to 1 m by Vissim (2–4 lanes per sample
   map, all `shoulder`-adjacent geometry).
 
+## Checking a file against the whole specification
+
+Judging the output one symptom at a time misses the shape of the problem and
+lets a fix break something else — both happened while this profile was being
+built. `uv run vissim-check <file.xodr>` runs one check per documented
+requirement and prints the measurement behind each:
+
+```
+  [PASS] header revMajor/revMinor below 1.5            declared 1.4
+  [PASS] no non-1.4 attributes                          none found
+  [PASS] geometry primitives supported                  {'paramPoly3': 382, 'line': 363}
+  [PASS] geometry length attribute matches its curve    0 mismatches
+  [PASS] planView sums to road@length                   0 roads differ
+  [PASS] consecutive geometries meet (C0)               worst 0.00e+00 m
+  [PASS] lane widths constant                           0 non-constant records
+  [PASS] width does not vary within a road by 0.25 m    Vissim inserts nothing
+  [FAIL] lane centres meet at joints (<0.1 m)           worst 0.372 m; >0.1 m: 15/28
+  [PASS] no importable road below 0.5 m                 shortest 10.928 m
+  [PASS] no lane below the 1.0 m clamp                  none
+  [PASS] no dangling road or junction reference         0 found
+  [PASS] every lane movement is expressed somewhere     clean
+  [PASS] every importable road reachable                0 unreachable
+  [PASS] no isolated importable road                    0
+  [PASS] elevation near the ground plane                z 0.00..2.41 m
+  [PASS] no absurd gradient (<15%)                      steepest 4.8%
+  [PASS] junctions have 3+ approaches                   all do
+
+  17/18 checks pass
+```
+
+It exits non-zero on a failure, so it can gate a conversion. Every threshold
+comes from the manual's import section, and two checks exist because a fix
+regressed them: the geometry-length one caught a lateral shift that left the
+``length`` attributes describing a curve that no longer existed, and the C0
+one caught the same shift pulling segments apart by 0.108 m.
+
+The one remaining failure is a residual: a connector's declared lane centre
+can sit up to 0.372 m from the lane it meets, because constant-izing a road's
+widths moves its lane centres and a rigid shift of the connector cannot match
+both of its ends at once. Vissim snaps a connector end onto the link's lane,
+so this is absorbed on import rather than reported — unlike the two problems
+above, which Vissim does report.
+
 ## The `target=vissim` profile
 
 ```bash
