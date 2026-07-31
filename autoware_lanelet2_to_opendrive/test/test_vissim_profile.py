@@ -532,3 +532,134 @@ def test_elevation_shift_also_moves_absolute_inertial_positions():
 def test_config_rejects_unknown_elevation_baseline():
     with pytest.raises(ValueError, match="elevation_baseline"):
         VissimConfig(elevation_baseline="sea-level")
+
+
+# ---------------------------------------------------------------------------
+# connector lane alignment
+# ---------------------------------------------------------------------------
+
+
+def _junction_tree() -> ET._Element:
+    """A 2-lane road, a single-lane connector onto its outer lane, and an exit.
+
+    The road's lanes are 3.0 m and 4.0 m wide but taper, so constant-izing
+    them moves the outer lane centre and the connector stops meeting it.
+    """
+    xml = """
+    <OpenDRIVE>
+      <header revMajor="1" revMinor="4"/>
+      <road id="1" length="20.0" junction="-1">
+        <link><successor elementType="junction" elementId="900"/></link>
+        <elevationProfile><elevation s="0.0" a="0.0" b="0.0" c="0.0" d="0.0"/></elevationProfile>
+        <planView><geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="20.0"><line/></geometry></planView>
+        <lanes><laneSection s="0.0">
+          <left>
+            <lane id="1" type="driving" level="false">
+              <width sOffset="0.0" a="3.0" b="0.05" c="0.0" d="0.0"/>
+            </lane>
+            <lane id="2" type="driving" level="false">
+              <width sOffset="0.0" a="4.0" b="-0.05" c="0.0" d="0.0"/>
+            </lane>
+          </left>
+          <center><lane id="0" type="none" level="false"/></center>
+        </laneSection></lanes>
+      </road>
+      <road id="2" length="10.0" junction="900">
+        <link>
+          <predecessor elementType="road" elementId="1" contactPoint="end"/>
+          <successor elementType="road" elementId="3" contactPoint="start"/>
+        </link>
+        <elevationProfile><elevation s="0.0" a="0.0" b="0.0" c="0.0" d="0.0"/></elevationProfile>
+        <planView><geometry s="0.0" x="20.0" y="5.5" hdg="0.0" length="10.0"><line/></geometry></planView>
+        <lanes><laneSection s="0.0">
+          <left>
+            <lane id="1" type="driving" level="false">
+              <width sOffset="0.0" a="4.0" b="0.0" c="0.0" d="0.0"/>
+              <link><successor id="1"/></link>
+            </lane>
+          </left>
+          <center><lane id="0" type="none" level="false"/></center>
+        </laneSection></lanes>
+      </road>
+      <road id="3" length="20.0" junction="-1">
+        <link><predecessor elementType="junction" elementId="900"/></link>
+        <elevationProfile><elevation s="0.0" a="0.0" b="0.0" c="0.0" d="0.0"/></elevationProfile>
+        <planView><geometry s="0.0" x="30.0" y="5.5" hdg="0.0" length="20.0"><line/></geometry></planView>
+        <lanes><laneSection s="0.0">
+          <left>
+            <lane id="1" type="driving" level="false">
+              <width sOffset="0.0" a="4.0" b="0.0" c="0.0" d="0.0"/>
+            </lane>
+          </left>
+          <center><lane id="0" type="none" level="false"/></center>
+        </laneSection></lanes>
+      </road>
+      <junction id="900">
+        <connection id="0" incomingRoad="1" connectingRoad="2" contactPoint="start">
+          <laneLink from="2" to="1"/>
+        </connection>
+      </junction>
+    </OpenDRIVE>
+    """
+    return ET.fromstring(xml.encode())
+
+
+def _lane_centre(root, road_id, lane_id, at_end):
+    road = root.find(f"road[@id='{road_id}']")
+    geometries = road.findall("planView/geometry")
+    geometry = geometries[-1] if at_end else geometries[0]
+    x = float(geometry.get("x"))
+    y = float(geometry.get("y"))
+    hdg = float(geometry.get("hdg"))
+    if at_end:
+        x += math.cos(hdg) * float(geometry.get("length"))
+        y += math.sin(hdg) * float(geometry.get("length"))
+    edge = 0.0
+    for lane in sorted(
+        road.findall("lanes/laneSection/left/lane"), key=lambda e: int(e.get("id"))
+    ):
+        width = float(lane.find("width").get("a"))
+        if int(lane.get("id")) == lane_id:
+            offset = edge + width / 2.0
+            return (x - math.sin(hdg) * offset, y + math.cos(hdg) * offset)
+        edge += width
+    return None
+
+
+def test_connector_is_slid_onto_the_lane_it_links():
+    root = _junction_tree()
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+
+    assert len(report.connectors_realigned) == 1
+    connector_id, start_shift, _ = report.connectors_realigned[0]
+    assert connector_id == "2"
+    assert abs(start_shift) > 1e-6
+
+    # The connector's lane centre now meets road 1's lane 2 at the joint.
+    ours = _lane_centre(root, "2", 1, at_end=False)
+    theirs = _lane_centre(root, "1", 2, at_end=True)
+    assert math.dist(ours, theirs) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_alignment_leaves_the_links_untouched():
+    """Only connecting roads move; a link's geometry must not."""
+    root = _junction_tree()
+    before = [
+        (g.get("x"), g.get("y"))
+        for g in root.find("road[@id='1']").findall("planView/geometry")
+    ]
+    apply_vissim_profile(root, VissimConfig(enabled=True))
+    after = [
+        (g.get("x"), g.get("y"))
+        for g in root.find("road[@id='1']").findall("planView/geometry")
+    ]
+    assert before == after
+
+
+def test_alignment_can_be_disabled():
+    root = _junction_tree()
+    report = apply_vissim_profile(
+        root, VissimConfig(enabled=True, align_connector_lanes=False)
+    )
+    assert report.connectors_realigned == []
+    assert root.find("road[@id='2']/planView/geometry").get("y") == "5.5"

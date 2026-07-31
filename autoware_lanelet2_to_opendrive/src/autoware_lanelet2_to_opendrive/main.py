@@ -2596,6 +2596,7 @@ class _Lanelet2ToOpenDRIVEConverter:
                 dissolve_non_intersection_junctions,
                 merge_consecutive_roads,
                 merge_parallel_lane_roads,
+                omit_unimported_roads,
                 reciprocate_lane_links,
             )
 
@@ -2677,6 +2678,25 @@ class _Lanelet2ToOpenDRIVEConverter:
                         chain.absorbed_road_ids,
                         chain.base_road_id,
                         chain.total_length,
+                    )
+            if self.config.vissim.omit_unimported_roads:
+                omitted = omit_unimported_roads(
+                    final_roads,
+                    lanelet_to_road_and_lane=lanelet_to_road_and_lane,
+                    lanelet_to_emitted_segments=mapping.lanelet_to_emitted_segments,
+                )
+                if omitted:
+                    logger.info(
+                        "Vissim topology: omitted %d road(s) Vissim cannot use "
+                        "— it builds links only from the lane types it imports, "
+                        "and an importable road with no link on either end "
+                        "would arrive unreachable: %s",
+                        len(omitted),
+                        ", ".join(
+                            f"road {rid} ({types}"
+                            f"{', isolated' if isolated else ''})"
+                            for rid, types, isolated in omitted
+                        ),
                     )
             filled = reciprocate_lane_links(final_roads)
             if filled:
@@ -3043,6 +3063,12 @@ def preprocess_and_convert_with_hydra(
         ),
         absorb_stub_max_length=(
             vissim_dict.get("absorb_stub_max_length", 3.0) if vissim_dict else 3.0
+        ),
+        omit_unimported_roads=(
+            vissim_dict.get("omit_unimported_roads", True) if vissim_dict else True
+        ),
+        align_connector_lanes=(
+            vissim_dict.get("align_connector_lanes", True) if vissim_dict else True
         ),
         untag_straight_turn_lanelets=(
             vissim_dict.get("untag_straight_turn_lanelets", True)

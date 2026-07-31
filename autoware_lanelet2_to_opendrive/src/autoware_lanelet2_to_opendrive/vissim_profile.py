@@ -130,6 +130,15 @@ class VissimConfig:
             arrive in Vissim as fragments where a connector belongs; joining
             the neighbours hands the stretch back to one. Applied in the
             pipeline by ``vissim_topology``.
+        align_connector_lanes: Slide each connecting road sideways so its lane
+            meets the lane it links to. Constant-izing widths moves a lane
+            centre — the further from the reference line the more — so the
+            connectors, which follow the true lane centre, no longer meet the
+            links; Vissim snaps them and the connector visibly kinks.
+        omit_unimported_roads: Drop roads Vissim cannot use — those carrying
+            only lane types it does not import (``shoulder``, ``sidewalk``) and
+            importable ones with no link on either end, which would arrive as
+            links floating unreachable in the network.
         absorb_stub_max_length: Length below which a road counts as a stub
             (metres). Default 3.0 — long enough to catch a dissolved
             junction's connectors, short enough that the gap the neighbours
@@ -154,6 +163,8 @@ class VissimConfig:
     elevation_baseline: Union[str, float] = "min"
     absorb_degenerate_stubs: bool = True
     absorb_stub_max_length: float = 3.0
+    omit_unimported_roads: bool = True
+    align_connector_lanes: bool = True
     untag_straight_turn_lanelets: bool = True
     merge_parallel_lane_roads: bool = True
     merge_consecutive_roads: bool = True
@@ -182,6 +193,7 @@ class VissimProfileReport:
     lanes_width_constantized: int = 0
     junctions_merged: int = 0
     elevation_shift: Optional[float] = None
+    connectors_realigned: List[Tuple[str, float, float]] = field(default_factory=list)
     roads_below_spline_spacing: List[str] = field(default_factory=list)
     roads_below_inserted_link_length: List[str] = field(default_factory=list)
     lanes_below_min_width: int = 0
@@ -206,6 +218,19 @@ class VissimProfileReport:
                 else "nothing"
             ),
         )
+        if self.connectors_realigned:
+            worst = max(
+                self.connectors_realigned,
+                key=lambda item: max(abs(item[1]), abs(item[2])),
+            )
+            log.info(
+                "Vissim profile: slid %d connector(s) sideways onto the lane "
+                "they link (constant widths move a lane centre); largest "
+                "correction %+.3f m on connector %s",
+                len(self.connectors_realigned),
+                max(worst[1], worst[2], key=abs),
+                worst[0],
+            )
         if self.roads_below_spline_spacing:
             log.warning(
                 "Vissim profile: %d roads shorter than the %.1f m Vissim "
@@ -379,6 +404,201 @@ def _shift_elevation(root: ET._Element, baseline: Union[str, float]) -> Optional
         if "z" in position.attrib:
             position.set("z", str(replace_subnormal(float(position.get("z")) - shift)))
     return shift
+
+
+def _road_frame(geometry: ET._Element, p: float):
+    """``(x, y, heading)`` on a geometry's reference line at station ``p``."""
+    import math
+
+    x = float(geometry.get("x"))
+    y = float(geometry.get("y"))
+    heading = float(geometry.get("hdg"))
+    length = float(geometry.get("length"))
+    cos_h, sin_h = math.cos(heading), math.sin(heading)
+    poly = geometry.find("paramPoly3")
+    if poly is None:
+        return (x + cos_h * p, y + sin_h * p, heading)
+    a = [float(poly.get(k, "0")) for k in ("aU", "bU", "cU", "dU")]
+    b = [float(poly.get(k, "0")) for k in ("aV", "bV", "cV", "dV")]
+    t = p / length if poly.get("pRange", "normalized") == "normalized" else p
+    u = a[0] + a[1] * t + a[2] * t * t + a[3] * t**3
+    v = b[0] + b[1] * t + b[2] * t * t + b[3] * t**3
+    du = a[1] + 2 * a[2] * t + 3 * a[3] * t * t
+    dv = b[1] + 2 * b[2] * t + 3 * b[3] * t * t
+    return (
+        x + cos_h * u - sin_h * v,
+        y + sin_h * u + cos_h * v,
+        heading + math.atan2(dv, du),
+    )
+
+
+def _lane_centre_offset(road: ET._Element, lane_id: int) -> Optional[float]:
+    """Signed ``t`` of a lane's centre, from the cumulative constant widths."""
+    section = road.find("lanes/laneSection")
+    if section is None:
+        return None
+    side = "left" if lane_id > 0 else "right"
+    container = section.find(side)
+    if container is None:
+        return None
+    sign = 1 if lane_id > 0 else -1
+    edge = 0.0
+    for lane in sorted(
+        container.findall("lane"), key=lambda e: sign * int(e.get("id"))
+    ):
+        width = lane.find("width")
+        value = float(width.get("a")) if width is not None else 0.0
+        if int(lane.get("id")) == lane_id:
+            return sign * (edge + value / 2.0)
+        edge += value
+    return None
+
+
+def _lane_point(road: ET._Element, lane_id: int, at_end: bool):
+    """World position of a lane's centre at one end of the road."""
+    import math
+
+    geometries = road.findall("planView/geometry")
+    if not geometries:
+        return None
+    geometry = geometries[-1] if at_end else geometries[0]
+    station = float(geometry.get("length")) if at_end else 0.0
+    x, y, heading = _road_frame(geometry, station)
+    offset = _lane_centre_offset(road, lane_id)
+    if offset is None:
+        return None
+    return (x - math.sin(heading) * offset, y + math.cos(heading) * offset)
+
+
+def _shift_connector_laterally(
+    connector: ET._Element, start_delta: float, end_delta: float
+) -> None:
+    """Slide a connecting road sideways by a linear ramp along its length.
+
+    Each ``<geometry>`` origin moves along its own normal by the ramp value at
+    that station, and the ``paramPoly3`` ``v`` polynomial — whose axis *is*
+    the lateral direction of the segment's local frame — takes the remaining
+    slope. Using the same ramp function on both sides of a segment boundary
+    keeps the chain continuous.
+    """
+    import math
+
+    from .opendrive.xml_utils import replace_subnormal
+
+    geometries = connector.findall("planView/geometry")
+    total = sum(float(g.get("length")) for g in geometries)
+    if total <= 0.0:
+        return
+    slope = (end_delta - start_delta) / total
+
+    for geometry in geometries:
+        station = float(geometry.get("s"))
+        delta = start_delta + slope * station
+        heading = float(geometry.get("hdg"))
+        geometry.set("x", str(float(geometry.get("x")) - math.sin(heading) * delta))
+        geometry.set("y", str(float(geometry.get("y")) + math.cos(heading) * delta))
+        poly = geometry.find("paramPoly3")
+        if poly is None or slope == 0.0:
+            continue
+        # v grows with the lateral offset; over the segment it must gain
+        # slope * length, expressed in whichever p-range the record uses.
+        length = float(geometry.get("length"))
+        span = length if poly.get("pRange") == "arcLength" else 1.0
+        poly.set(
+            "bV",
+            str(
+                replace_subnormal(
+                    float(poly.get("bV", "0")) + slope * length / max(span, 1e-12)
+                )
+            ),
+        )
+
+
+def align_connector_lanes(root: ET._Element) -> List[Tuple[str, float, float]]:
+    """Slide each connector so its lane meets the lane it links to.
+
+    A road's lane centre follows from its cumulative lane widths, so
+    constant-izing those widths moves it — by more the further the lane sits
+    from the reference line. The connectors keep the geometry of the true lane
+    centre, so the two no longer meet: on the Odaiba clip 14 of 28
+    connector-to-lane joints were out by more than 0.1 m and the worst by
+    0.58 m. Vissim snaps the connector end onto the link's lane, which is what
+    bends the connector into a visible kink at each end.
+
+    Sliding the connector by a linear ramp — the error at its start, the error
+    at its end — closes both joints without touching the links.
+
+    Returns ``(connector_id, start_shift, end_shift)`` per adjusted road.
+    """
+    roads = {road.get("id"): road for road in root.iter("road")}
+    adjusted: List[Tuple[str, float, float]] = []
+
+    for junction in root.iter("junction"):
+        for connection in junction.findall("connection"):
+            connector = roads.get(connection.get("connectingRoad"))
+            if connector is None:
+                continue
+            link = connector.find("link")
+            if link is None:
+                continue
+
+            deltas = {}
+            for side, at_end in (("predecessor", False), ("successor", True)):
+                end = link.find(side)
+                if end is None or end.get("elementType") != "road":
+                    continue
+                neighbour = roads.get(end.get("elementId"))
+                if neighbour is None:
+                    continue
+                neighbour_at_end = end.get("contactPoint") != "start"
+
+                # Which lane pair meets here.
+                pairs = []
+                if side == "predecessor":
+                    pairs = [
+                        (int(link_elem.get("to")), int(link_elem.get("from")))
+                        for link_elem in connection.findall("laneLink")
+                    ]
+                else:
+                    for lane in connector.iter("lane"):
+                        if lane.get("type") != "driving":
+                            continue
+                        lane_link = lane.find("link")
+                        far = (
+                            lane_link.find("successor")
+                            if lane_link is not None
+                            else None
+                        )
+                        if far is not None:
+                            pairs.append((int(lane.get("id")), int(far.get("id"))))
+                errors = []
+                for own_lane, other_lane in pairs:
+                    ours = _lane_point(connector, own_lane, at_end)
+                    theirs = _lane_point(neighbour, other_lane, neighbour_at_end)
+                    if ours is None or theirs is None:
+                        continue
+                    # Signed along the connector's normal at that end.
+                    geometries = connector.findall("planView/geometry")
+                    geometry = geometries[-1] if at_end else geometries[0]
+                    station = float(geometry.get("length")) if at_end else 0.0
+                    _, _, heading = _road_frame(geometry, station)
+                    import math
+
+                    normal = (-math.sin(heading), math.cos(heading))
+                    errors.append(
+                        (theirs[0] - ours[0]) * normal[0]
+                        + (theirs[1] - ours[1]) * normal[1]
+                    )
+                if errors:
+                    deltas[side] = sum(errors) / len(errors)
+
+            start_delta = deltas.get("predecessor", deltas.get("successor", 0.0))
+            end_delta = deltas.get("successor", deltas.get("predecessor", 0.0))
+            if abs(start_delta) < 1e-6 and abs(end_delta) < 1e-6:
+                continue
+            _shift_connector_laterally(connector, start_delta, end_delta)
+            adjusted.append((connector.get("id"), start_delta, end_delta))
+    return adjusted
 
 
 def _replace_geo_reference(root: ET._Element, proj: str) -> bool:
@@ -638,6 +858,10 @@ def apply_vissim_profile(
 
     if config.constant_lane_widths:
         report.lanes_width_constantized = _constantize_lane_widths(root)
+        # Constant widths move a lane centre, so the connectors no longer meet
+        # the lanes they link; close that after the widths are final.
+        if config.align_connector_lanes:
+            report.connectors_realigned = align_connector_lanes(root)
 
     report.elevation_shift = _shift_elevation(root, config.elevation_baseline)
 

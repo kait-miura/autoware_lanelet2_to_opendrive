@@ -1280,6 +1280,89 @@ def merge_consecutive_roads(
     return merged
 
 
+#: Lane types Vissim turns into links. A road carrying nothing else is
+#: invisible to it, so keeping it only clutters the file and other viewers.
+VISSIM_IMPORTED_LANE_TYPES = frozenset(
+    {
+        "driving",
+        "entry",
+        "exit",
+        "offRamp",
+        "onRamp",
+        "roadWorks",
+        "tram",
+        "rail",
+        "biking",
+    }
+)
+
+
+def omit_unimported_roads(
+    roads: List[Road],
+    *,
+    lanelet_to_road_and_lane: Optional[Dict[int, Tuple[int, int]]] = None,
+    lanelet_to_emitted_segments: Optional[Dict[int, List[dict]]] = None,
+) -> List[Tuple[int, str, bool]]:
+    """Drop roads Vissim cannot use, and isolated ones it would import empty.
+
+    Vissim builds a link only from the lane types it imports; ``shoulder`` and
+    ``sidewalk`` are not among them, so such a road is invisible there while
+    still cluttering the file and any other viewer. On the Odaiba clip eight
+    roads carry nothing but a shoulder or sidewalk lane and none of them has a
+    ``<link>`` at all, which is why they render as disconnected patches with
+    gaps between them.
+
+    Two more roads carry only a ``biking`` lane. Vissim *does* import that
+    type, but with no link on either end they would arrive as links floating
+    unreachable in the network, so they go too — an importable road is only
+    kept when something connects to it.
+
+    Returns ``(road_id, lane_types, was_isolated)`` per dropped road.
+    """
+    dropped: List[Tuple[int, str, bool]] = []
+    removed: Set[int] = set()
+
+    for road in roads:
+        types = {
+            lane.lane_type.value
+            if hasattr(lane.lane_type, "value")
+            else str(lane.lane_type)
+            for lane in _driving_lanes(road)
+        }
+        if not types:
+            continue
+        importable = types & VISSIM_IMPORTED_LANE_TYPES
+        isolated = not _linked_road_ids(road) and (
+            road.link is None
+            or (road.link.predecessor is None and road.link.successor is None)
+        )
+        if importable and not isolated:
+            continue
+        if not importable or isolated:
+            removed.add(road.id)
+            dropped.append((road.id, ",".join(sorted(types)), isolated))
+
+    if not removed:
+        return dropped
+
+    roads[:] = [road for road in roads if road.id not in removed]
+    if lanelet_to_road_and_lane is not None:
+        for lanelet_id in [
+            lanelet_id
+            for lanelet_id, (road_id, _) in lanelet_to_road_and_lane.items()
+            if road_id in removed
+        ]:
+            del lanelet_to_road_and_lane[lanelet_id]
+    if lanelet_to_emitted_segments is not None:
+        for lanelet_id, segments in list(lanelet_to_emitted_segments.items()):
+            kept = [s for s in segments if s.get("road_id") not in removed]
+            if kept:
+                lanelet_to_emitted_segments[lanelet_id] = kept
+            else:
+                del lanelet_to_emitted_segments[lanelet_id]
+    return dropped
+
+
 def _lane_by_id(road: Road, lane_id: int):
     """Return the lane with ``lane_id`` in the road's first section."""
     for lane in _driving_lanes(road):
