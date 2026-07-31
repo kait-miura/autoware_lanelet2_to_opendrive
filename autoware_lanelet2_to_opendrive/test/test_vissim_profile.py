@@ -32,6 +32,10 @@ def _sample_tree() -> ET._Element:
         <geoReference><![CDATA[+proj=utm +zone=54 +lat_0=35.0 +lon_0=139.8 +datum=WGS84 +units=m +no_defs]]></geoReference>
       </header>
       <road id="1" length="10.0" junction="-1" rule="LHT">
+        <elevationProfile>
+          <elevation s="0.0" a="5.0" b="0.1" c="0.0" d="0.0"/>
+          <elevation s="4.0" a="5.4" b="0.05" c="0.0" d="0.0"/>
+        </elevationProfile>
         <planView>
           <geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="4.0">
             <paramPoly3 aU="0.0" bU="1.0" cU="0.01" dU="0.001"
@@ -60,6 +64,9 @@ def _sample_tree() -> ET._Element:
         </lanes>
       </road>
       <road id="2" length="0.01" junction="1000">
+        <elevationProfile>
+          <elevation s="0.0" a="7.0" b="0.0" c="0.0" d="0.0"/>
+        </elevationProfile>
         <planView>
           <geometry s="0.0" x="0.0" y="0.0" hdg="0.0" length="0.01">
             <line/>
@@ -76,6 +83,9 @@ def _sample_tree() -> ET._Element:
           </laneSection>
         </lanes>
       </road>
+      <controller id="0">
+        <positionInertial x="1.0" y="2.0" z="12.0"/>
+      </controller>
     </OpenDRIVE>
     """
     return ET.fromstring(xml.encode())
@@ -443,3 +453,82 @@ def test_local_frame_matches_converter_projection():
         # metres, so allow that much slack.
         assert absolute.x - local_x == pytest.approx(e0, abs=1.0)
         assert absolute.y - local_y == pytest.approx(n0, abs=1.0)
+
+
+# ---------------------------------------------------------------------------
+# elevation baseline
+# ---------------------------------------------------------------------------
+
+
+def _surface_z(root):
+    return [float(e.get("a")) for e in root.iter("elevation")]
+
+
+def _gradients(root):
+    return [float(e.get("b", "0")) for e in root.iter("elevation")]
+
+
+def test_elevation_baseline_min_puts_the_lowest_surface_at_zero():
+    """Lanelet2 stores absolute elevation, so the network floats otherwise."""
+    root = _sample_tree()
+    before = _surface_z(root)
+    gradients = _gradients(root)
+    assert min(before) == 5.0  # metres above sea level
+
+    report = apply_vissim_profile(root, VissimConfig(enabled=True))
+
+    assert report.elevation_shift == pytest.approx(5.0)
+    assert min(_surface_z(root)) == pytest.approx(0.0)
+    # Shifted by exactly one constant, so every relative height is preserved.
+    assert [z - 5.0 for z in before] == pytest.approx(_surface_z(root))
+    # And not a single gradient changed.
+    assert _gradients(root) == pytest.approx(gradients)
+
+
+def test_elevation_baseline_mean_centres_the_network():
+    root = _sample_tree()
+    before = _surface_z(root)
+    expected = sum(before) / len(before)
+
+    report = apply_vissim_profile(
+        root, VissimConfig(enabled=True, elevation_baseline="mean")
+    )
+
+    assert report.elevation_shift == pytest.approx(expected)
+    assert sum(_surface_z(root)) / len(before) == pytest.approx(0.0)
+
+
+def test_elevation_baseline_explicit_value_shifts_by_that_amount():
+    root = _sample_tree()
+    before = _surface_z(root)
+    report = apply_vissim_profile(
+        root, VissimConfig(enabled=True, elevation_baseline=2.5)
+    )
+    assert report.elevation_shift == pytest.approx(2.5)
+    assert [z - 2.5 for z in before] == pytest.approx(_surface_z(root))
+
+
+def test_elevation_baseline_none_keeps_absolute_elevation():
+    root = _sample_tree()
+    before = _surface_z(root)
+    report = apply_vissim_profile(
+        root, VissimConfig(enabled=True, elevation_baseline="none")
+    )
+    assert report.elevation_shift is None
+    assert _surface_z(root) == pytest.approx(before)
+
+
+def test_elevation_shift_also_moves_absolute_inertial_positions():
+    """positionInertial is absolute; zOffset is relative and must not move."""
+    root = _sample_tree()
+    position = root.find(".//positionInertial")
+    assert float(position.get("z")) == 12.0
+
+    apply_vissim_profile(root, VissimConfig(enabled=True))
+
+    assert float(position.get("z")) == pytest.approx(7.0)
+
+
+def test_config_rejects_unknown_elevation_baseline():
+    with pytest.raises(ValueError, match="elevation_baseline"):
+        VissimConfig(elevation_baseline="sea-level")

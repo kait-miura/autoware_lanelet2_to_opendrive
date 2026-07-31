@@ -32,7 +32,7 @@ tree — without touching the conversion pipeline — so that other targets
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 import lxml.etree as ET
 
@@ -45,6 +45,9 @@ VISSIM_INSERTED_LINK_LENGTH = 1.1  # length of links inserted at width changes
 VISSIM_MIN_SPLINE_SPACING = 0.5  # minimum spline point spacing
 
 _P_RANGE_MODES = ("arcLength", "normalized")
+
+# Named references for the elevation baseline shift.
+_ELEVATION_BASELINES = ("none", "min", "mean")
 
 # Lane types the Vissim importer actually turns into links; only these are
 # checked in the width report (sidewalk/shoulder etc. are ignored by Vissim).
@@ -97,6 +100,15 @@ class VissimConfig:
             machinery — at every junction, so a plain widening or off-ramp
             otherwise arrives as an intersection. Applied in the conversion
             pipeline by ``vissim_topology``, before the mapping is written.
+        elevation_baseline: Shift every elevation so the network sits near
+            ``z = 0``. Lanelet2 maps store **absolute** elevation (the Odaiba
+            clip runs 4.4–12.7 m above sea level) and the converter subtracts
+            nothing unless ``map.offset.z`` is set, so the whole network
+            floats above Vissim's background plane by that amount — and by a
+            varying amount where the terrain rises. ``"min"`` puts the lowest
+            road surface at zero, ``"mean"`` centres the network, ``"none"``
+            keeps absolute elevation, and a float shifts by that many metres.
+            Only a constant offset is applied, so every gradient is preserved.
         merge_overlapping_junctions: Merge junctions whose connecting roads
             attach to the same road endpoint. The divergence synthesis can
             emit chained junctions that meet at one physical point (two
@@ -114,6 +126,7 @@ class VissimConfig:
     constant_lane_widths: bool = True
     merge_overlapping_junctions: bool = True
     dissolve_non_intersection_junctions: bool = True
+    elevation_baseline: Union[str, float] = "min"
 
     def __post_init__(self) -> None:
         if self.param_poly3_p_range not in _P_RANGE_MODES:
@@ -121,6 +134,12 @@ class VissimConfig:
                 f"param_poly3_p_range must be one of {_P_RANGE_MODES}, "
                 f"got '{self.param_poly3_p_range}'"
             )
+        if isinstance(self.elevation_baseline, str):
+            if self.elevation_baseline not in _ELEVATION_BASELINES:
+                raise ValueError(
+                    "elevation_baseline must be a number or one of "
+                    f"{_ELEVATION_BASELINES}, got '{self.elevation_baseline}'"
+                )
 
 
 @dataclass
@@ -132,6 +151,7 @@ class VissimProfileReport:
     geo_reference_replaced: bool = False
     lanes_width_constantized: int = 0
     junctions_merged: int = 0
+    elevation_shift: Optional[float] = None
     roads_below_spline_spacing: List[str] = field(default_factory=list)
     roads_below_inserted_link_length: List[str] = field(default_factory=list)
     lanes_below_min_width: int = 0
@@ -143,12 +163,18 @@ class VissimProfileReport:
         log.info(
             "Vissim profile: stripped %d rule attributes, "
             "re-parameterized %d paramPoly3 segments, geoReference %s, "
-            "constantized widths on %d lanes, merged %d co-located junctions",
+            "constantized widths on %d lanes, merged %d co-located junctions, "
+            "elevation shifted by %s",
             self.rule_attributes_stripped,
             self.param_poly3_reparameterized,
             "replaced" if self.geo_reference_replaced else "kept",
             self.lanes_width_constantized,
             self.junctions_merged,
+            (
+                f"{-self.elevation_shift:+.2f} m"
+                if self.elevation_shift is not None
+                else "nothing"
+            ),
         )
         if self.roads_below_spline_spacing:
             log.warning(
@@ -286,6 +312,43 @@ def _reparameterize_param_poly3(root: ET._Element) -> int:
         del poly.attrib["pRange"]
         converted += 1
     return converted
+
+
+def _shift_elevation(root: ET._Element, baseline: Union[str, float]) -> Optional[float]:
+    """Translate every elevation so the network sits near ``z = 0``.
+
+    Each ``<elevation>`` is ``z(ds) = a + b·ds + c·ds² + d·ds³``, so
+    subtracting a constant from ``a`` shifts the surface without touching a
+    single gradient. ``<positionInertial>`` carries absolute coordinates and
+    is shifted with it; ``zOffset`` and ``<cornerLocal>`` are relative to the
+    road surface and are left alone.
+
+    Returns the applied shift, or ``None`` when nothing was changed.
+    """
+    from .opendrive.xml_utils import replace_subnormal
+
+    elevations = list(root.iter("elevation"))
+    if not elevations:
+        return None
+
+    if isinstance(baseline, str):
+        if baseline == "none":
+            return None
+        surface = [float(e.get("a", "0")) for e in elevations]
+        shift = min(surface) if baseline == "min" else sum(surface) / len(surface)
+    else:
+        shift = float(baseline)
+    if shift == 0.0:
+        return None
+
+    for elevation in elevations:
+        elevation.set(
+            "a", str(replace_subnormal(float(elevation.get("a", "0")) - shift))
+        )
+    for position in root.iter("positionInertial"):
+        if "z" in position.attrib:
+            position.set("z", str(replace_subnormal(float(position.get("z")) - shift)))
+    return shift
 
 
 def _replace_geo_reference(root: ET._Element, proj: str) -> bool:
@@ -545,6 +608,8 @@ def apply_vissim_profile(
 
     if config.constant_lane_widths:
         report.lanes_width_constantized = _constantize_lane_widths(root)
+
+    report.elevation_shift = _shift_elevation(root, config.elevation_baseline)
 
     if config.merge_overlapping_junctions:
         report.junctions_merged = _merge_overlapping_junctions(root)

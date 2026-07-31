@@ -2957,6 +2957,9 @@ def preprocess_and_convert_with_hydra(
             if vissim_dict
             else True
         ),
+        elevation_baseline=(
+            vissim_dict.get("elevation_baseline", "min") if vissim_dict else "min"
+        ),
     )
     if vissim_config.enabled and vissim_config.local_geo_reference:
         # The local-frame PROJ string needs the resolved MGRS grid and the

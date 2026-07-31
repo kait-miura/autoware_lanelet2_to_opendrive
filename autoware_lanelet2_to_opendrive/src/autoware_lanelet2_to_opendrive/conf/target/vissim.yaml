@@ -70,6 +70,18 @@ vissim:
   # ("Nodes ... overlap on link ..." error, conflict areas undetermined).
   merge_overlapping_junctions: true
 
+  # Lanelet2 maps store ABSOLUTE elevation (the Odaiba clip runs 4.4-12.7 m
+  # above sea level) and the converter subtracts nothing unless map.offset.z
+  # is set, so the whole network floats above Vissim's background plane — by a
+  # varying amount where the terrain rises. Shift it so the lowest road
+  # surface sits at z = 0. Only a constant offset is applied, so every
+  # gradient is preserved.
+  #   min  — lowest road surface at zero (default)
+  #   mean — centre the network on zero
+  #   none — keep absolute elevation
+  #   <number> — shift by that many metres
+  elevation_baseline: "min"
+
   # Turn junctions that carry no crossing movement into ordinary road links.
   # Vissim places a node — with the whole intersection machinery, including
   # auto-generated conflict areas — at every <junction>, so the divergence

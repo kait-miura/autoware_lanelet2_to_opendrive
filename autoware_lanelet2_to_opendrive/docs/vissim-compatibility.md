@@ -62,7 +62,7 @@ Legend: ✅ satisfied ｜ ⚠ partial / needs verification ｜ ❌ not satisfied
 | Reference line limited to line / spiral / arc / cubic polynomial | ⚠ | Only `<line>` and `<paramPoly3>` are emitted (arc/spiral classes exist but are opt-in #466). Whether Vissim's "cubic polynomial" includes *parametric* cubics must be verified | verify; fallback documented below |
 | Geometry continuity (links drawn from reference line) | ✅ | C0 gap ≤ 0.0001 m, heading jumps ≤ 1.5° across all 9 386 consecutive geometry pairs in both samples | none |
 | `planView` lengths consistent | ✅ | Σ geometry length = `road@length` (< 1 mm) for all 753 roads | none |
-| Elevation profile → Z | ✅ | one `<elevation>` per geometry segment, cubic in s | none |
+| Elevation profile → Z | ⚠→✅ | one `<elevation>` per geometry segment, cubic in s, internally continuous to 0.000 m and never steeper than 15 %. But the values are **absolute** elevation (Odaiba: road surfaces 4.36–7.19 m, map points up to 12.71 m above sea level) because `map.offset.z` is 0, so the whole network floated above Vissim's background plane — by a varying amount where the terrain rises | `vissim.elevation_baseline` (default `min`) |
 | Lane sections → links | ✅ | exactly one `<laneSection>` per road; no mid-road width discontinuities | none |
 | Lane types importable (driving/biking/…) | ⚠ | `driving`, `biking` import; `shoulder`, `sidewalk` are ignored by Vissim (acceptable — pedestrian networks are separate in Vissim) | none |
 | Positive/negative lane index semantics | ⚠ | all driving lanes are positive (left side) with `rule="LHT"`; Vissim builds positive-index lanes as opposite-direction links | verify with LHT import setting |
@@ -166,6 +166,33 @@ connecting roads are recorded in it as `dissolved_junction_roads` so the
 junction-lanelet validation knows a `turn_direction` lanelet outside a
 junction is intended here (the same role `skipped_synthetic_roads` plays).
 
+### Severe — the network floating above the background plane (fixed)
+
+Lanelet2 maps store **absolute** elevation. On the Odaiba clip the source
+points run 4.36–12.71 m above sea level (median 5.51 m) and
+`map.offset.z` is `0`, so the emitted road surfaces carry 4.36–7.19 m.
+Vissim's background plane is at `z = 0`, so the whole network sat 4–7 m
+above it — and because the terrain rises across the clip, some stretches
+floated noticeably more than others.
+
+The elevation data itself is sound: internal continuity of every
+`<elevationProfile>` is exact (largest step between consecutive
+`<elevation>` records: 0.000 m over 916 joints), road-to-road boundary
+jumps stay under 0.21 m, and no road exceeds a 15 % gradient. The problem
+is purely the datum.
+
+`vissim.elevation_baseline` (default `"min"`) subtracts one constant from
+every `<elevation>`'s `a` coefficient — and from `<positionInertial>`,
+which is absolute — so the lowest road surface lands at `z = 0`
+(Odaiba: shift −4.36 m, surfaces now 0.00–2.83 m). Because it is a pure
+translation, **every gradient is bit-identical**; `zOffset` and
+`<cornerLocal>` are relative to the road surface and are left alone.
+
+Note that the other map configs already set this on the input side —
+`nishishinjuku` uses `offset.z: 42.49998`. Setting `map.offset.z` instead
+also works, but it moves the Lanelet2 origin for *every* target;
+`elevation_baseline` keeps the change inside the Vissim export.
+
 ### Known, not fixable at write time
 
 - **Conflict-area priority warnings** (`The priority of conflict area "N"
@@ -247,6 +274,7 @@ is untouched. Settings (see `conf/target/vissim.yaml`):
 | `vissim.param_poly3_p_range` | `normalized` | `normalized`: exact re-parameterization to `p ∈ [0,1]`, `pRange` attribute removed (schema-clean). `arcLength`: keep coefficients and attribute |
 | `vissim.local_geo_reference` | `true` | replace the header proj-string with the exact local-frame tmerc string |
 | `vissim.constant_lane_widths` | `true` | collapse each lane's `<width>` chain to a single constant record (arc-length-weighted mean) — prevents Vissim's per-variation connector/1.1 m-link insertion from fragmenting the network |
+| `vissim.elevation_baseline` | `"min"` | shift every elevation so the lowest road surface sits at `z = 0` (`"mean"` centres it, `"none"` keeps absolute, a number shifts by that much). Only a constant offset, so gradients are preserved |
 | `vissim.merge_overlapping_junctions` | `true` | merge junctions whose connecting roads terminate at the same road endpoint into one junction — Vissim builds one node per junction, and co-located junctions produce "Nodes … overlap on link …" errors with undetermined conflict areas |
 | `vissim.dissolve_non_intersection_junctions` | `true` | turn junctions that carry no crossing movement (pure merges and diverges) into ordinary road links, so Vissim does not place a node — and therefore no intersection — where the road merely widens or forks. Odaiba: 7 junctions → the 1 real intersection |
 
