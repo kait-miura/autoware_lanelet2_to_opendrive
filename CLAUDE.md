@@ -866,3 +866,36 @@ from .config import DEFAULT_CONFIG
 - **Documents intent**: Clear names explain what values control
 - **Type safety**: Dataclasses catch errors at development time
 - **Professional code**: Industry best practice for configuration management
+
+
+## 出力先ツールの制約（PTV Vissim への OpenDRIVE インポート）
+
+このリポジトリの出力 xodr は Vissim にもインポートされる。
+各項目に確度を明記する。「未検証」を既成事実として扱わないこと。
+
+### 確度: 高（Vissim マニュアル 2.6.9 に明記）
+- laneSection 1つ = Link 1本。road/link の predecessor・successor = Connector
+- lane/width は定数化される（多項式は無視、1 m 未満は 1 m に切り上げ）
+- junction 要素の predecessor/successor は処理されない。ノードも作られない
+  → internal road 側の road-level link（elementType="road" + contactPoint）が必須
+- インポートされる lane type: driving, entry, exit, offRamp, onRamp,
+  roadWorks, tram, rail, biking のみ。sidewalk 等は無視される
+- revMajor/revMinor でバージョン検証。1.5 以降は問題要素を含む可能性あり
+
+### 確度: 高（PTV 公式ヘルプ VISSIM 2021 ENG に明記）
+- 交錯領域は「異なる Link/Connector の面が平面で重なる箇所」に自動生成。削除不可
+- 生成されない条件: z 差 > 1.0 m / 重なり ≤ 0.5 m /
+  交錯開始から 5 m 以内に一方の Link が終わりコネクターが始まらない
+- タイプ: Crossing / Merge / Branching
+- 色: 緑=優先, 赤=非優先, 両方赤=分岐, 両方黄=パッシブ
+
+### 確度: 中（推論。実測で検証すること）
+- 同一 Link 内の車線間には交錯領域が作られない
+  → この前提の上に設計方針が乗っているので、最優先で検証する
+- リンク数 = 全 laneSection 数
+- 正の lane id は避け、対向車線は別 road にする
+
+### 確度: 低（未検証。実装の根拠にしないこと）
+- Vissim が elevationProfile をインポートするかどうか不明。
+  マニュアルの「使用する openDRIVE エレメント」表に記載がない。
+  「標高を出せば立体交差の偽交錯が消える」は未確認の仮説。
