@@ -1,0 +1,42 @@
+# Autoware 公開サンプル地図 (autowarefoundation/autoware_map の sample-map-planning) 用
+#
+# 受領物に依存しない公開素材だけで CARLA 用の道路網を作るための設定。
+# 投影は同梱の map_projector_info.yaml による: projector_type MGRS / mgrs_grid 54SVE。
+#
+# 実測 (2026-08-30): この設定で target=carla の変換が PASS する。
+#   road 190 / junction 18 / signal 35、信号 24 灯の位置検証は 0 mismatch (許容 1.0m)。
+#   地図は**加工せずそのまま**渡せる。main.py が
+#   autoware_lanelet2_extension_python.regulatory_elements を import しているので、
+#   detection_area / virtual_traffic_light といった Autoware 拡張の規制要素も読める。
+
+# MGRS grid for map projection (REQUIRED)
+mgrs_grid: 54SVE
+
+# Traffic rule for Japan (Left-Hand Traffic)
+traffic_rule: "LHT"
+
+# ISO 3166 country code stamped on emitted OpenDRIVE <signal> elements.
+country: "JP"
+
+# この地図は素の公開物をそのまま使うので、前処理は要らない。
+merge_operations: []
+move_point_operations: []
+delete_point_operations: []
+remove_lanelet_operations: []
+remove_turn_direction_operations: []
+
+# ParamPoly3 segment generation configuration
+parampoly3:
+  enabled: true
+  min_segment_length: 0.5  # meters (CARLA minimum requirement)
+  default_segment_length: 1.0  # meters
+  max_segments: 100
+  min_segments: 1
+  coefficient_epsilon: 1.0e-8
+
+# Width spline sampling configuration
+width_estimation:
+  adaptive_sampling: true
+  min_samples: 5
+  max_samples: 50
+  default_sample_interval: 5.0  # meters
